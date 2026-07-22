@@ -1,6 +1,6 @@
 ---
 name: StructuredMemoryManager
-version: 2.1.0
+version: 2.0.0
 description: "基于独立文件存储、YAML索引和加权二级检索机制的长期记忆管理skill。通过 Shell 执行 cli.py 进行记忆操作。"
 license: MIT
 category: memory-management
