@@ -1,6 +1,7 @@
 # StructuredMemoryManager
 
 > 让 Agent 告别"失忆"和"模糊记忆"的结构化长期记忆管理 Skill。
+> v3.0 加入向量数据库（ChromaDB）语义检索能力。
 
 ## 简介
 
@@ -9,7 +10,9 @@ StructuredMemoryManager 是一个全面接管 Agent 记忆生成、存储、索�
 - **三分类存储**：习惯偏好、技能方法、项目详情分而治之
 - **独立文件**：每条记忆一个 `.md` 文件，按类别存入子目录
 - **YAML 结构化索引**：全局 `memory_index.md` 维护所有条目的元数据
-- **加权二级检索**：总目录粗筛 → 独立文件精读，差异化权重排序，高效精准
+- **★ 向量语义检索**（v3.0）：基于 ChromaDB + all-MiniLM-L6-v2 嵌入模型，支持自然语言查询和语义相似匹配
+- **加权检索**：向量相似度 × 分类权重 × emphasis × priority × recency 综合排序
+- **双模式自动降级**：chromadb 不可用时自动回退到关键字匹配检索
 - **强调与提及追踪**：用户主动强调的内容和反复提及的技能获得最高权重
 - **优先级与保鲜期**：高优记忆永不丢失，临时信息自动过期
 - **自动归档**：超阈值时自动归档低优先级旧条目
@@ -25,10 +28,13 @@ StructuredMemoryManager/
 ├── scripts/
 │   ├── cli.py                 # ★ 统一调度入口（Agent 唯一调用入口）
 │   ├── _base.py               # 共享基础模块（YAML解析、加权算法、文件管理）
-│   ├── add_memory.py          # 添加记忆（cli.py 内部调用）
-│   ├── search_memory.py       # 检索记忆（cli.py 内部调用）
-│   ├── confirm_memory.py      # 确认/更新记忆（cli.py 内部调用）
-│   └── rebuild_index.py       # 重建索引（cli.py 内部调用）
+│   ├── vector_store.py        # ★ 向量数据库封装（ChromaDB）
+│   ├── add_memory.py          # 添加记忆（含向量库同步）
+│   ├── search_memory.py       # 检索记忆（向量/关键字双模式）
+│   ├── confirm_memory.py      # 确认/更新记忆（含向量库同步）
+│   ├── rebuild_index.py       # 重建索引（含向量库重建）
+│   └── download_model.py      # ★ 嵌入模型下载工具（HF 镜像加速）
+├── .cache/                    # ★ 本地缓存（嵌入模型+chroma，自动下载，~86MB）
 ├── templates/
 │   ├── memory_index.md        # 总目录模板
 │   ├── habits_template.md     # 习惯偏好模板
@@ -40,7 +46,7 @@ StructuredMemoryManager/
 │   └── best_practices.md      # 设计思路与最佳实践
 ├── README.md                  # 本文件
 ├── LICENSE                    # MIT 许可证
-└── .gitignore                 # Git 忽略规则
+└── .gitignore                 # Git 忽略规则（含 .cache/ 排除）
 ```
 
 ## 安装
@@ -49,6 +55,8 @@ StructuredMemoryManager/
 
 - Python 3.8+
 - PyYAML >= 5.0（可选，有内置回退方案）
+- chromadb >= 0.5.0（可选，启用向量语义检索；未安装时自动降级为关键字匹配）
+- onnxruntime + tokenizers + tqdm（chromadb 的嵌入模型依赖，随 chromadb 安装）
 
 ### 安装步骤
 
@@ -57,6 +65,15 @@ StructuredMemoryManager/
 3. （可选）安装 PyYAML 以获得更好的 YAML 解析能力：
    ```bash
    pip install pyyaml
+   ```
+4. （推荐）安装 chromadb 启用向量语义检索：
+   ```bash
+   pip install chromadb
+   ```
+   首次使用向量检索时，ChromaDB 会自动下载 all-MiniLM-L6-v2 ONNX 嵌入模型（约 86MB）到 `.cache/` 目录。
+   如自动下载缓慢，可手动执行加速下载：
+   ```bash
+   python scripts/download_model.py
    ```
 
 ### 首次初始化
@@ -85,6 +102,18 @@ python scripts/cli.py search "测试" --json
 ```
 
 ## 使用方式
+
+### 检索模式（v3.0 新增）
+
+| 模式 | 触发条件 | 说明 |
+|------|---------|------|
+| **向量模式**（默认） | chromadb 已安装 | 用嵌入模型做语义相似度检索，再按权重综合排序 |
+| **关键字模式**（降级） | chromadb 未安装，或显式 `--no-vector` | 总目录关键字匹配 → 独立文件精读 |
+
+向量模式的优势：
+- 支持**自然语言查询**（如 "我之前说过的关于 UI 偏好的事"）
+- **语义相似**而非字面匹配（"不使用表情符号"能匹配到"emoji"）
+- 仍然遵循原有的**加权检索规范**（分类权重、emphasis、priority 等全部保留）
 
 ### 对于 Agent（自动）
 
@@ -137,12 +166,15 @@ python "{CLI}" add \
 | 触发信号 | 示例 | 命令 |
 |---------|------|------|
 | 新对话开始 | 需要加载用户的历史偏好和约束 | `python "{CLI}" search "偏好" --high-priority --json` |
+| 自然语言语义检索 | "我之前说过的关于 UI 偏好的事" | `python "{CLI}" search "我之前说过的关于 UI 偏好的事" --json` |
 | 用户问过往信息 | "我之前说过什么？" | `python "{CLI}" search "..." --json` |
 | 执行任务前检查约束 | 要生成图片前检查是否允许 | `python "{CLI}" search "图片" --high-priority --json` |
 | 查找历史经验 | 类似任务需要参考之前的做法 | `python "{CLI}" search "关键词" -t "标签" --json` |
 | 项目进展查询 | "我的项目现在什么状态？" | `python "{CLI}" search "进展" --category project --json` |
+| 强制关键字检索 | 需要精确匹配而非语义匹配 | `python "{CLI}" search "..." --no-vector --json` |
 
 **检索结果按加权权重降序排列**，高权重记忆优先纳入上下文。
+向量模式下每条结果包含 `similarity` 字段（0~1，越大越相似）。
 
 #### 读取单条记忆 — `cli.py read`
 
@@ -187,11 +219,11 @@ python scripts/rebuild_index.py --all
 
 | 方法 | CLI 命令 | 功能 | 触发时机 |
 |------|---------|------|---------|
-| `add_memory()` | `cli.py add` | 添加记忆并维护索引 | Agent 需要持久化信息时 |
-| `search_memory()` | `cli.py search` | 加权二级检索记忆 | Agent 需要回忆信息时 |
+| `add_memory()` | `cli.py add` | 添加记忆并维护索引（同步写入向量库） | Agent 需要持久化信息时 |
+| `search_memory()` | `cli.py search` | 向量/关键字双模式加权检索 | Agent 需要回忆信息时 |
 | `read_memory()` | `cli.py read` | 读取单条记忆完整内容 | 需要查看某条记忆的详情 |
-| `confirm_memory()` | `cli.py confirm` | 确认/更新记忆状态 | 维护、到期确认、优先级调整、强调标记 |
-| `rebuild_index()` | `cli.py rebuild` | 重建文件索引 | 索引与正文不一致时修复 |
+| `confirm_memory()` | `cli.py confirm` | 确认/更新记忆状态（同步更新向量库元数据） | 维护、到期确认、优先级调整、强调标记 |
+| `rebuild_index()` | `cli.py rebuild` | 重建文件索引+向量库 | 索引与正文不一致时修复 |
 
 ## 记忆分类
 
@@ -360,17 +392,4 @@ python scripts/cli.py rebuild --json
 MIT License
 
 ---
-
-## 更新日志
-
-### v2.0.0 (2026-07-23)
-
-**CLI 统一入口与 Agent 执行方式改造**
-
-- **新增 `cli.py` 统一调度入口**：5个子命令 `add/search/read/confirm/rebuild`，Agent 通过 Shell 执行 `python cli.py <command>` 完成所有记忆操作，不再直接调用 Python 函数
-- **SKILL.md 精简**：从 10.7KB 精简至 3.2KB，移除与 system.md 重复的命令细节，只保留元数据 + 触发场景 + 加载指令
-- **system.md 更新**：所有使用场景从抽象函数签名改为具体 Shell 命令模板
-- **references/ 全面更新**：best_practices、schema_guide、usage_examples 三个文件重写，匹配当前独立文件架构，移除过时的单文件架构描述（`internal_index`、`priority_tags`、三级检索等）
-
-**设计理由**：Skill 工具加载后 Agent 只能看到文档文本，无法直接调用 Python 函数。将抽象调用映射为 Shell 命令模板后，Agent 能机械执行而无需猜测调用方式。
 
