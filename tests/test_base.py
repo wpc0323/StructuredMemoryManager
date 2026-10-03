@@ -243,3 +243,19 @@ class TestMemoryStats:
             )
         stats = get_memory_stats(memory_dir=mem_dir)
         assert stats["categories"]["habit"]["active_files"] == 3
+
+
+# ============================================================
+# 向量距离映射
+# ============================================================
+
+class TestDistanceMapping:
+    def test_cosine_distance_mapping(self):
+        from vector_store import _distance_to_similarity
+        assert _distance_to_similarity(0.0) == 1.0
+        assert _distance_to_similarity(0.25) == 0.75
+        assert _distance_to_similarity(1.0) == 0.0
+        # 超界钳制：远处结果趋近 0，而不是旧的 1/(1+d) 保底 1/3
+        assert _distance_to_similarity(1.5) == 0.0
+        assert _distance_to_similarity(-0.5) == 1.0
+        assert _distance_to_similarity("bad") == 0.0

@@ -17,29 +17,35 @@ try:
     from ._base import (
         read_memory_file, write_memory_file, now_iso,
         read_memory_index, write_memory_index, MEMORY_DIR,
-        CATEGORY_DIR_MAP, is_vector_available
+        CATEGORY_DIR_MAP, is_vector_available, memory_lock, relpath_posix
     )
     from .vector_store import rebuild_vector_store
 except ImportError:
     from _base import (
         read_memory_file, write_memory_file, now_iso,
         read_memory_index, write_memory_index, MEMORY_DIR,
-        CATEGORY_DIR_MAP, is_vector_available
+        CATEGORY_DIR_MAP, is_vector_available, memory_lock, relpath_posix
     )
     from vector_store import rebuild_vector_store
 
 
 def rebuild_index(memory_dir: Path = None) -> dict:
+    """扫描所有记忆文件，重建总目录索引（带跨进程锁）。详见 _rebuild_index_impl。"""
+    mem_dir = memory_dir or MEMORY_DIR
+    with memory_lock(mem_dir):
+        return _rebuild_index_impl(mem_dir=mem_dir)
+
+
+def _rebuild_index_impl(mem_dir: Path = None) -> dict:
     """
     扫描所有记忆文件，重建总目录索引。
 
     参数:
-        memory_dir: 自定义记忆目录
+        mem_dir: 已解析的记忆目录（由外层 rebuild_index 传入）
 
     返回:
         {"success": True, "message": "...", "entries_count": N}
     """
-    mem_dir = memory_dir or MEMORY_DIR
     entries = []
 
     # 遍历所有类别子目录
@@ -49,9 +55,11 @@ def rebuild_index(memory_dir: Path = None) -> dict:
             continue
 
         for md_file in cat_dir.rglob("*.md"):
-            # rglob 会同时覆盖子目录（含 archive/），归档文件也会被索引，
-            # 保证归档后的记忆仍可检索
-            rel_path = str(md_file.relative_to(mem_dir))
+            # rglob 会同时覆盖子目录：archive/ 中的文件会被索引（归档仍可检索）；
+            # deleted/ 是软删除区，必须跳过，否则被删除的记忆会被 rebuild 复活
+            rel_path = relpath_posix(md_file, mem_dir)
+            if "deleted" in rel_path.split("/"):
+                continue
 
             fm, body = read_memory_file(md_file)
             if not fm or not fm.get("entry_id"):

@@ -104,9 +104,20 @@ class TestAddAndSearch:
         results = search(mem_dir, "React")
         assert [r["category"] for r in results] == ["project", "habit", "skill"]
 
-    def test_duplicate_content_creates_unique_files(self, mem_dir):
+    def test_duplicate_content_deduplicated(self, mem_dir):
+        """默认去重：内容重复的 add 合并进已有记忆，不再新建文件"""
         r1 = add(mem_dir, category="habit", content="同样的内容")
         r2 = add(mem_dir, category="habit", content="同样的内容")
+        assert r2.get("deduplicated") is True
+        assert r2["merged_into"]["entry_id"] == r1["entry_id"]
+        # 只有一个文件
+        assert len(list((mem_dir / "habits").glob("*.md"))) == 1
+
+    def test_no_dedup_forces_new_file(self, mem_dir):
+        """--no-dedup / allow_dedup=False 强制新建"""
+        r1 = add(mem_dir, category="habit", content="同样的内容")
+        r2 = add(mem_dir, category="habit", content="同样的内容", allow_dedup=False)
+        assert r2.get("deduplicated") is None
         assert r1["file_path"] != r2["file_path"]
         assert r1["entry_id"] != r2["entry_id"]
 

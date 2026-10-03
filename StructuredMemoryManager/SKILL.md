@@ -1,6 +1,6 @@
 ---
 name: StructuredMemoryManager
-version: 3.1.0
+version: 3.2.0
 description: "【每次新对话开始时必须首先调用】预加载用户偏好、习惯、历史决策等高优记忆，确保回复符合用户要求。也用于记录新偏好/习惯、保存任务总结、存储项目决策。"
 license: MIT
 category: memory-management
@@ -92,6 +92,12 @@ Agent 加载时应定位 `cli.py` 的绝对路径，后续所有调用均使用�
 | 确认/更新记忆状态 | `python "{CLI}" confirm "<path>" "<id>" <action> --json` |
 | 索引不一致时修复 | `python "{CLI}" rebuild --json` |
 | 查看记忆库健康状态 | `python "{CLI}" stats --json` |
+| 删除错误/过时记忆 | `python "{CLI}" delete "<path>" --json`（`--hard` 永久删除） |
+| 记忆维护检查 | `python "{CLI}" maintenance --json` |
+| 强制新建不去重 | `python "{CLI}" add ... --no-dedup --json` |
+
+> 去重说明：add 默认开启自动去重，与已有记忆重复的内容会合并进原文件
+> （追加正文、提升 mention_count/emphasis/优先级），不新建文件。
 
 ## 加载指令
 
@@ -109,12 +115,15 @@ StructuredMemoryManager/
 │   └── system.md              # Agent 持久化系统指令（含完整命令模板和规则）
 ├── scripts/
 │   ├── cli.py                 # ★ 统一调度入口
-│   ├── _base.py               # 共享基础模块
+│   ├── _base.py               # 共享基础模块（原子写入/进程锁/YAML解析/权重）
 │   ├── vector_store.py        # ★ 向量数据库封装（ChromaDB）
-│   ├── add_memory.py          # 添加记忆（含向量库同步）
-│   ├── search_memory.py       # 检索记忆（向量/关键字双模式）
+│   ├── add_memory.py          # 添加记忆（自动去重合并 + 向量库同步）
+│   ├── search_memory.py       # 检索记忆（向量/关键字双模式，空结果自动降级）
 │   ├── confirm_memory.py      # 确认/更新记忆（含向量库同步）
+│   ├── delete_memory.py       # 删除记忆（默认软删除到 deleted/，可恢复）
+│   ├── maintenance.py         # 记忆维护检查（过期/归档候选/长期未更新）
 │   ├── rebuild_index.py       # 重建索引（含向量库重建）
+│   ├── session_start_hook.py  # ★ SessionStart hook 预加载脚本（见 integrations/）
 │   └── download_model.py      # ★ 嵌入模型下载工具（HF 镜像加速）
 ├── .cache/                    # ★ 本地缓存（嵌入模型+chroma，自动下载）
 ├── templates/                 # 初始化模板

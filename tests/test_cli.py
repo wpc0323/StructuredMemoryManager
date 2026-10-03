@@ -83,3 +83,31 @@ def test_cli_env_var_isolation(mem_dir, tmp_path):
     run_cli(["add", "-c", "habit", "--content", "第一套记忆", "--json"], mem_dir)
     out = run_cli(["search", "第一套记忆", "--no-vector", "--json"], other_dir)
     assert json.loads(out) == []
+
+
+def test_delete_via_cli(mem_dir):
+    run_cli(["add", "-c", "habit", "--content", "待删除记忆", "--json"], mem_dir)
+    results = json.loads(run_cli(["search", "待删除", "--no-vector", "--json"], mem_dir))
+    out = run_cli(["delete", results[0]["file_path"], "--json"], mem_dir)
+    assert json.loads(out)["success"] is True
+    assert json.loads(run_cli(["search", "待删除", "--no-vector", "--json"], mem_dir)) == []
+    # 软删除后文件进入 deleted/ 且不被 rebuild 复活
+    run_cli(["rebuild", "--json"], mem_dir)
+    assert json.loads(run_cli(["stats", "--json"], mem_dir))["index_entries"] == 0
+
+
+def test_maintenance_via_cli(mem_dir):
+    run_cli(["add", "-c", "habit", "--content", "维护检查条目", "--json"], mem_dir)
+    out = run_cli(["maintenance", "--json"], mem_dir)
+    result = json.loads(out)
+    assert result["success"] is True
+    assert result["summary"]["index_entries"] == 1
+
+
+def test_dedup_via_cli(mem_dir):
+    run_cli(["add", "-c", "habit", "--content", "重复内容测试", "--json"], mem_dir)
+    out = run_cli(["add", "-c", "habit", "--content", "重复内容测试", "--json"], mem_dir)
+    assert json.loads(out).get("deduplicated") is True
+    out2 = run_cli(["add", "-c", "habit", "--content", "重复内容测试",
+                    "--no-dedup", "--json"], mem_dir)
+    assert json.loads(out2).get("deduplicated") is None

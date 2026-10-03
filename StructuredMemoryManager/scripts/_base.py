@@ -9,7 +9,9 @@ StructuredMemoryManager - 共享基础模块
 
 import os
 import re
+import time
 import random
+import contextlib
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
@@ -48,6 +50,10 @@ TEMPLATES_DIR = SKILL_ROOT / "templates"
 ARCHIVE_THRESHOLD = 50       # 触发归档的条目数阈值
 ARCHIVE_AGE_DAYS = 90        # 归档年龄阈值（天）
 ARCHIVE_AGE_DAYS_FALLBACK = 60  # 第二轮归档年龄阈值
+STALE_DAYS = 180             # medium 优先级条目超过该天数未更新时建议确认
+DEDUP_SIMILARITY = 0.95      # 向量去重阈值：新记忆与已有记忆相似度达到该值时合并（1-余弦距离）
+LOCK_TIMEOUT_SECONDS = 10.0  # 进程锁等待超时
+LOCK_STALE_SECONDS = 30.0    # 锁文件超过该时长视为残留锁，自动清理
 
 # 类别对应的子目录名
 CATEGORY_DIR_MAP = {
@@ -543,6 +549,102 @@ def is_expired(expires_str: Optional[str]) -> bool:
 
 
 # ============================================================
+# 原子写入与并发保护
+# ============================================================
+
+def atomic_write_text(path: Path, text: str):
+    """
+    原子写入：先写同目录临时文件，再 os.replace 替换目标文件。
+    避免写入中途崩溃留下半截文件损坏索引；临时文件统一 LF 换行，跨平台可同步。
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    os.replace(tmp_path, path)
+
+
+@contextlib.contextmanager
+def memory_lock(mem_dir: Path = None, timeout: float = LOCK_TIMEOUT_SECONDS,
+                stale_seconds: float = LOCK_STALE_SECONDS):
+    """
+    跨进程尽力而为的互斥锁（O_CREAT|O_EXCL 抢占锁文件）。
+    用于保护「读索引 → 修改 → 写回」这类非原子操作，避免多会话并发写坏索引。
+    超时未获取到锁时降级继续执行（yield False），不阻塞主流程；
+    锁文件超过 stale_seconds 未更新视为残留锁，自动清理。
+    """
+    mem_dir = mem_dir or MEMORY_DIR
+    mem_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = mem_dir / ".index.lock"
+    acquired = False
+    fd = None
+    start = time.time()
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            acquired = True
+            break
+        except FileExistsError:
+            try:
+                if time.time() - lock_path.stat().st_mtime > stale_seconds:
+                    lock_path.unlink()
+                    continue
+            except OSError:
+                pass
+            if time.time() - start > timeout:
+                break
+            time.sleep(0.05)
+        except OSError:
+            break
+    try:
+        if acquired and fd is not None:
+            try:
+                os.write(fd, str(os.getpid()).encode())
+            except OSError:
+                pass
+        yield acquired
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if acquired:
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
+
+
+def relpath_posix(path: Path, base: Path = None) -> str:
+    """返回 path 相对 base 的 POSIX 风格相对路径（统一正斜杠，跨平台索引可移植）"""
+    base = Path(base) if base else MEMORY_DIR
+    return str(Path(path).relative_to(Path(base))).replace("\\", "/")
+
+
+def same_relpath(a: str, b: str) -> bool:
+    """比较两个索引相对路径是否相同（忽略路径分隔符差异）"""
+    return str(a).replace("\\", "/") == str(b).replace("\\", "/")
+
+
+def normalize_text_key(text: str) -> str:
+    """文本归一化（去空白、小写），用于重复记忆的精确匹配"""
+    return re.sub(r"\s+", "", (text or "")).lower()
+
+
+def days_since_or_none(date_str: Optional[str]) -> Optional[int]:
+    """计算距今天数，日期无效时返回 None（区别于 days_since 的 999 兜底）"""
+    if not date_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(date_str)
+        return (datetime.now(TIMEZONE_CN) - dt).days
+    except (ValueError, TypeError):
+        return None
+
+
+# ============================================================
 # 文件管理工具
 # ============================================================
 
@@ -601,11 +703,10 @@ def read_memory_file(file_path: Path) -> Tuple[Dict[str, Any], str]:
 
 
 def write_memory_file(file_path: Path, front_matter: Dict[str, Any], body: str):
-    """写入记忆文件（front matter + body）"""
+    """写入记忆文件（front matter + body，原子写入）"""
     fm_text = build_front_matter(front_matter)
     full_content = fm_text + body
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    file_path.write_text(full_content, encoding='utf-8')
+    atomic_write_text(file_path, full_content)
 
 
 def read_memory_index(memory_dir: Path = None) -> Dict[str, Any]:
@@ -667,9 +768,11 @@ def get_memory_stats(memory_dir: Path = None) -> dict:
     for category, dir_name in CATEGORY_DIR_MAP.items():
         cat_dir = mem_dir / dir_name
         archive_dir = cat_dir / "archive"
+        deleted_dir = cat_dir / "deleted"
         stats["categories"][category] = {
             "active_files": len(list(cat_dir.glob("*.md"))) if cat_dir.exists() else 0,
             "archived_files": len(list(archive_dir.glob("*.md"))) if archive_dir.exists() else 0,
+            "deleted_files": len(list(deleted_dir.glob("*.md"))) if deleted_dir.exists() else 0,
         }
     index_fm = read_memory_index(memory_dir=mem_dir)
     stats["index_entries"] = len(index_fm.get("entries", []))

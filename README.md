@@ -1,7 +1,7 @@
 # StructuredMemoryManager
 
 > 让 Agent 告别"失忆"和"模糊记忆"的结构化长期记忆管理 Skill。
-> v3.0 加入向量数据库（ChromaDB）语义检索能力；v3.1 修复降级检索与 YAML 回退解析缺陷，新增 `stats` 健康检查、pytest 测试套件与 CI。
+> v3.0 加入向量数据库（ChromaDB）语义检索能力；v3.1 修复降级检索与 YAML 回退解析缺陷，新增 `stats` 健康检查、pytest 测试套件与 CI；v3.2 新增自动去重、删除/维护命令、Hooks 自动预加载与原子写入保护。
 
 ## 简介
 
@@ -20,6 +20,10 @@ StructuredMemoryManager 是一个全面接管 Agent 记忆生成、存储、索�
 - **统一 CLI 入口**：所有操作通过 `cli.py` 执行，Agent 无需直接调用 Python 函数
 - **stats 健康检查**（v3.1）：一条命令查看记忆库文件数、索引条数与向量库状态
 - **pytest 测试套件 + CI**（v3.1）：覆盖回退解析、加权检索、归档与 CLI 端到端
+- **自动去重合并**（v3.2）：重复记录不再产生新文件，合并进原记忆并自动升级提及计数/强调/优先级
+- **删除与维护**（v3.2）：`delete` 软删除可恢复（同步向量库），`maintenance` 列出过期/归档候选/长期未更新条目
+- **Hooks 自动预加载**（v3.2）：SessionStart 钩子自动注入高优记忆，不再依赖 Agent 自觉触发
+- **原子写入 + 进程锁**（v3.2）：临时文件 + `os.replace` 原子替换，锁保护索引读改写，多会话并发不再写坏索引
 
 ## 文件结构
 
@@ -30,11 +34,14 @@ StructuredMemoryManager/
 │   └── system.md              # Agent 持久化系统指令
 ├── scripts/
 │   ├── cli.py                 # ★ 统一调度入口（Agent 唯一调用入口）
-│   ├── _base.py               # 共享基础模块（YAML解析、加权算法、文件管理）
+│   ├── _base.py               # 共享基础模块（YAML解析、加权算法、原子写入、进程锁）
 │   ├── vector_store.py        # ★ 向量数据库封装（ChromaDB）
-│   ├── add_memory.py          # 添加记忆（含向量库同步）
+│   ├── add_memory.py          # 添加记忆（自动去重合并 + 向量库同步）
 │   ├── search_memory.py       # 检索记忆（向量/关键字双模式）
 │   ├── confirm_memory.py      # 确认/更新记忆（含向量库同步）
+│   ├── delete_memory.py       # 删除记忆（默认软删除到 deleted/）
+│   ├── maintenance.py         # 记忆维护检查（过期/归档候选/长期未更新）
+│   ├── session_start_hook.py  # ★ SessionStart hook 预加载脚本
 │   ├── rebuild_index.py       # 重建索引（含向量库重建）
 │   └── download_model.py      # ★ 嵌入模型下载工具（HF 镜像加速）
 ├── .cache/                    # ★ 本地缓存（嵌入模型+chroma，自动下载，~86MB）
@@ -50,6 +57,7 @@ StructuredMemoryManager/
 ├── README.md                  # 本文件
 ├── LICENSE                    # MIT 许可证
 ├── .gitignore                 # Git 忽略规则（含 .cache/、__pycache__/ 排除）
+├── integrations/              # Hooks 接入指南（ZCode / Claude Code）
 ├── tests/                     # pytest 测试套件
 └── .github/
     └── workflows/ci.yml       # CI（Python 3.9~3.12 + 无PyYAML回退模式）
@@ -210,6 +218,8 @@ python "{CLI}" read "habits/xxx.md" --json
 | `de_emphasize` | `python "{CLI}" confirm "<path>" "<id>" de_emphasize --json` | 取消强调标记 |
 | `bump_mention` | `python "{CLI}" confirm "<path>" "<id>" bump_mention --json` | 增加提及次数 |
 | `stats` | `python "{CLI}" stats --json` | 查看记忆库健康状态（文件数、索引条数、向量库可用性） |
+| `maintenance` | `python "{CLI}" maintenance --json` | 列出过期/归档候选/长期未更新/索引缺失条目 |
+| `delete` | `python "{CLI}" delete "<path>" --json` | 删除记忆（默认软删除可恢复，`--hard` 永久删除） |
 | `rebuild` | `python "{CLI}" rebuild --json` | 索引与正文不一致时全量重建 |
 
 ### 对于开发者（手动测试）
@@ -238,6 +248,8 @@ python scripts/rebuild_index.py --all
 | `search_memory()` | `cli.py search` | 向量/关键字双模式加权检索 | Agent 需要回忆信息时 |
 | `read_memory()` | `cli.py read` | 读取单条记忆完整内容 | 需要查看某条记忆的详情 |
 | `confirm_memory()` | `cli.py confirm` | 确认/更新记忆状态（同步更新向量库元数据） | 维护、到期确认、优先级调整、强调标记 |
+| `delete_memory()` | `cli.py delete` | 删除记忆（默认软删除到 deleted/，同步向量库） | 用户否认某条记忆、记忆错误或彻底过时 |
+| `maintenance()` | `cli.py maintenance` | 列出过期/归档候选/长期未更新/索引缺失条目 | 定期健康检查 |
 | `rebuild_index()` | `cli.py rebuild` | 重建文件索引+向量库 | 索引与正文不一致时修复 |
 
 ## 记忆分类
@@ -405,6 +417,44 @@ python scripts/cli.py stats --json
 | Python | >=3.8 | 是 | 运行环境 |
 | PyYAML | >=5.0 | 推荐 | YAML解析，无则启用内置简易解析器 |
 | pytest | >=7.0 | 开发 | 运行测试套件 |
+
+## 可靠性与维护（v3.2 新增）
+
+### 自动去重
+
+`add` 默认开启去重，解决"同一偏好被反复记录导致文件膨胀"：
+
+- **精确匹配**：新内容归一化后与已有摘要相同、或已包含在正文中 → 合并
+- **向量匹配**（chromadb 可用时）：语义相似度 ≥ 0.95 → 合并（阈值经文本核对，
+  避免误合并；旧版相似度映射会把所有结果垫高到 1/3 以上，v3.2 已校准）
+- **合并是无损的**：新内容追加进原文件正文（逐字重复不重复追加），skill 的
+  `mention_count` +1，`emphasis`/更高优先级会传播，索引与向量库同步更新
+- 确需另存新条目时加 `--no-dedup`
+
+### 删除记忆
+
+记忆系统必须能"遗忘"。`delete` 默认软删除：文件移入该类别 `deleted/` 子目录
+（可手动移回恢复），索引与向量库同步移除、检索不再命中，且 `rebuild`
+不会让已删除记忆复活。`--hard` 永久删除。
+
+### 记忆维护
+
+`maintenance` 让保鲜期体系可执行：列出已过期（建议 confirm/extend/downgrade）、
+归档候选、medium 超 180 天未更新（建议向用户确认）、索引缺失文件（建议 rebuild）
+的条目清单。
+
+### 原子写入与并发保护
+
+- 所有记忆文件和索引的写入都是"临时文件 + `os.replace`"原子替换，崩溃不会留下半截文件
+- `add`/`confirm`/`delete`/`rebuild` 全程持有跨进程锁（`.index.lock`），
+  多会话并发操作不会互相覆盖索引；锁超时自动降级不阻塞，残留锁自动清理
+- 索引路径统一 POSIX 正斜杠，记忆目录可跨操作系统同步
+
+### Hooks 自动预加载
+
+在 ZCode / Claude Code 中配置 SessionStart 钩子后，每次会话开始自动注入
+全部高优先级记忆（关键字模式、零网络依赖、失败静默不影响会话）。
+配置示例见 [integrations/README.md](integrations/README.md)。
 
 ## 设计文档
 

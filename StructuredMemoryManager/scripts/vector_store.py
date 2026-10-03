@@ -123,6 +123,24 @@ def _get_collection(memory_dir: Path = None):
 
 
 # ============================================================
+# 距离与相似度
+# ============================================================
+
+def _distance_to_similarity(distance) -> float:
+    """
+    将 ChromaDB 距离转换为 0~1 的相似度（越大越相似）。
+    余弦距离 = 1 - 余弦相似度，故直接取 1 - distance；
+    对无上界的 L2 距离该映射同样是单调的，远处结果趋近 0，
+    不会像旧映射 1/(1+d) 那样给所有结果发放 1/3 的保底相似度、
+    稀释 compute_weight 的分类权重设计。
+    """
+    try:
+        return max(0.0, min(1.0, 1.0 - float(distance)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# ============================================================
 # 元数据构建
 # ============================================================
 
@@ -347,13 +365,7 @@ def query_memory_vector(
         md = metadatas[i] if i < len(metadatas) else {}
         dist = distances[i] if i < len(distances) else 0.0
 
-        # ChromaDB 默认使用余弦距离，distance 越小越相似
-        # 转换为 similarity: similarity = 1 - distance/2 (近似)
-        # 对于 L2 距离，用 1/(1+distance) 更稳健
-        try:
-            similarity = 1.0 / (1.0 + float(dist))
-        except (ValueError, TypeError):
-            similarity = 0.0
+        similarity = _distance_to_similarity(dist)
 
         # 从 document 还原 summary 和 content
         # document 格式: "{summary}\n\n{content}"
@@ -386,6 +398,53 @@ def query_memory_vector(
         })
 
     return output
+
+
+def find_similar_memories(
+    text: str,
+    n_results: int = 5,
+    category: str = None,
+    memory_dir: Path = None
+) -> dict:
+    """
+    查找与给定文本语义高度相似的已有记忆，供 add_memory 去重使用。
+    返回原始距离而非排序用 similarity，调用方按 DEDUP_SIMILARITY 阈值判断。
+
+    返回:
+        {"success": True/False, "skipped": bool, "matches":
+            [{"entry_id", "file_path", "category", "distance", "similarity"}]}
+    """
+    if not HAS_CHROMADB:
+        return {"success": True, "skipped": True, "matches": []}
+
+    collection, err = _get_collection(memory_dir)
+    if collection is None:
+        return {"success": False, "skipped": False, "error": err, "matches": []}
+
+    try:
+        kwargs = {"query_texts": [text], "n_results": n_results}
+        if category:
+            kwargs["where"] = {"category": category}
+        results = collection.query(**kwargs)
+    except Exception as e:
+        return {"success": False, "skipped": False, "error": str(e), "matches": []}
+
+    ids = results.get("ids", [[]])[0] if results.get("ids") else []
+    distances = results.get("distances", [[]])[0] or []
+    metadatas = results.get("metadatas", [[]])[0] or []
+
+    matches = []
+    for i, entry_id in enumerate(ids):
+        dist = distances[i] if i < len(distances) else 2.0
+        md = metadatas[i] if i < len(metadatas) else {}
+        matches.append({
+            "entry_id": entry_id,
+            "file_path": md.get("file_path", ""),
+            "category": md.get("category", ""),
+            "distance": float(dist),
+            "similarity": _distance_to_similarity(dist),
+        })
+    return {"success": True, "skipped": False, "matches": matches}
 
 
 def list_all_vector_memories(
@@ -446,7 +505,7 @@ def list_all_vector_memories(
             "expires": md.get("expires"),
             "summary": summary,
             "content_snippet": content,
-            "similarity": 1.0,  # 无查询时无相似度
+            "similarity": 0.0,  # 无查询时无语义相似度，不参与 keyword_score 加分
         })
 
     return output

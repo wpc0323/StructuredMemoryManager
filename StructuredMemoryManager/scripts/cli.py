@@ -10,6 +10,8 @@ StructuredMemoryManager - 统一命令入口 (cli.py)
   python cli.py search <query> [options]
   python cli.py read   <file_path>
   python cli.py confirm <file_path> <entry_id> <action> [options]
+  python cli.py delete <file_path> [--hard]
+  python cli.py maintenance
   python cli.py rebuild
   python cli.py stats
 
@@ -34,6 +36,8 @@ try:
     from .add_memory import add_memory
     from .search_memory import search_memory, read_memory
     from .confirm_memory import confirm_memory
+    from .delete_memory import delete_memory
+    from .maintenance import maintenance
     from .rebuild_index import rebuild_index
     from ._base import get_memory_stats, is_vector_available
     from .vector_store import get_vector_store_stats
@@ -41,6 +45,8 @@ except ImportError:
     from add_memory import add_memory
     from search_memory import search_memory, read_memory
     from confirm_memory import confirm_memory
+    from delete_memory import delete_memory
+    from maintenance import maintenance
     from rebuild_index import rebuild_index
     from _base import get_memory_stats, is_vector_available
     from vector_store import get_vector_store_stats
@@ -65,6 +71,7 @@ def cmd_add(args) -> dict:
         project_name=args.project_name,
         emphasis=args.emphasis,
         mention_count=args.mention_count,
+        allow_dedup=not args.no_dedup,
     )
 
 
@@ -99,6 +106,16 @@ def cmd_confirm(args) -> dict:
 def cmd_rebuild(args) -> dict:
     """执行 rebuild_index 命令"""
     return rebuild_index()
+
+
+def cmd_delete(args) -> dict:
+    """执行 delete_memory 命令"""
+    return delete_memory(file_path=args.file_path, hard=args.hard)
+
+
+def cmd_maintenance(args) -> dict:
+    """执行 maintenance 命令"""
+    return maintenance()
 
 
 def cmd_stats(args) -> dict:
@@ -146,6 +163,8 @@ def main():
                        help="标记为用户主动强调/重点 (影响加权检索权重)")
     p_add.add_argument("--mention-count", type=int, default=0,
                        help="提及次数 (skill 类别，>=3 视为反复提及)")
+    p_add.add_argument("--no-dedup", action="store_true",
+                       help="禁用自动去重，强制新建独立记忆文件")
     _add_json_flag(p_add)
 
     # ── search ───────────────────────────────────────
@@ -191,6 +210,19 @@ def main():
     p_rebuild = subparsers.add_parser("rebuild", help="全量重建总目录索引")
     _add_json_flag(p_rebuild)
 
+    # ── delete ───────────────────────────────────────
+    p_delete = subparsers.add_parser("delete", help="删除记忆（默认软删除到 deleted/ 子目录）")
+    p_delete.add_argument("file_path",
+                          help="目标文件路径 (相对于 memory 目录，如 habits/xxx.md)")
+    p_delete.add_argument("--hard", action="store_true",
+                          help="永久删除文件（默认软删除，可手动恢复）")
+    _add_json_flag(p_delete)
+
+    # ── maintenance ──────────────────────────────────
+    p_maint = subparsers.add_parser("maintenance",
+                                    help="记忆维护检查（过期/归档候选/长期未更新/索引缺失）")
+    _add_json_flag(p_maint)
+
     # ── stats ────────────────────────────────────────
     p_stats = subparsers.add_parser("stats", help="查看记忆库状态（文件数、索引条数、向量库可用性）")
     _add_json_flag(p_stats)
@@ -208,6 +240,8 @@ def main():
         "read": cmd_read,
         "confirm": cmd_confirm,
         "rebuild": cmd_rebuild,
+        "delete": cmd_delete,
+        "maintenance": cmd_maintenance,
         "stats": cmd_stats,
     }
 
@@ -229,7 +263,16 @@ def main():
                     print(f"    文件: {r.get('file_path','')} | ID: {r.get('entry_id','')} "
                           f"| 权重: {r.get('weight',0):.0f} | 匹配分: {r.get('score',0)}\n")
         else:
-            print(result)
+            if args.command == "delete" and isinstance(result, dict):
+                print(result.get("message") or result.get("error", ""))
+            elif args.command == "maintenance" and isinstance(result, dict):
+                s = result.get("summary", {})
+                print(f"过期 {s.get('expired', 0)} 条 | 归档候选 {s.get('archive_candidates', 0)} 条 "
+                      f"| 长期未更新 {s.get('stale', 0)} 条 | 索引缺失文件 {s.get('missing_files', 0)} 条")
+                if result.get("hint"):
+                    print(f"提示: {result['hint']}")
+            else:
+                print(result)
 
 
 if __name__ == "__main__":

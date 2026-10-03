@@ -18,14 +18,14 @@ try:
     from ._base import (
         read_memory_file, write_memory_file, now_iso,
         read_memory_index, write_memory_index, MEMORY_DIR, is_vector_available,
-        resolve_within_memory_dir
+        resolve_within_memory_dir, memory_lock
     )
     from .vector_store import update_memory_metadata
 except ImportError:
     from _base import (
         read_memory_file, write_memory_file, now_iso,
         read_memory_index, write_memory_index, MEMORY_DIR, is_vector_available,
-        resolve_within_memory_dir
+        resolve_within_memory_dir, memory_lock
     )
     from vector_store import update_memory_metadata
 
@@ -38,6 +38,25 @@ def confirm_memory(
     new_priority: str = None,
     mention_count: int = None,
     memory_dir: Path = None
+) -> dict:
+    """确认或更新记忆状态（带跨进程锁）。参数详见 _confirm_memory_impl。"""
+    mem_dir = memory_dir or MEMORY_DIR
+    with memory_lock(mem_dir):
+        return _confirm_memory_impl(
+            file_path=file_path, entry_id=entry_id, action=action,
+            new_expires=new_expires, new_priority=new_priority,
+            mention_count=mention_count, mem_dir=mem_dir,
+        )
+
+
+def _confirm_memory_impl(
+    file_path: str,
+    entry_id: str,
+    action: str,
+    new_expires: str = None,
+    new_priority: str = None,
+    mention_count: int = None,
+    mem_dir: Path = None
 ) -> dict:
     """
     确认或更新记忆状态。
@@ -57,12 +76,11 @@ def confirm_memory(
         new_expires: 新过期日期 (extend时必填)
         new_priority: 新优先级 (upgrade时默认"high"，downgrade时默认"low")
         mention_count: 提及次数 (bump_mention时使用，默认当前值+1)
-        memory_dir: 自定义记忆目录
+        mem_dir: 已解析的记忆目录（由外层 confirm_memory 传入）
 
     返回:
         {"success": True/False, "message": "..."}
     """
-    mem_dir = memory_dir or MEMORY_DIR
     abs_path = resolve_within_memory_dir(file_path, mem_dir)
     if abs_path is None:
         return {"success": False, "error": f"非法路径（越出记忆目录）: {file_path}"}

@@ -20,18 +20,22 @@ try:
         read_memory_index, write_memory_index,
         now_iso, now_date_str, generate_entry_id, MEMORY_DIR,
         ARCHIVE_THRESHOLD, ARCHIVE_AGE_DAYS, ARCHIVE_AGE_DAYS_FALLBACK,
-        CATEGORY_DIR_MAP, days_since, is_vector_available
+        CATEGORY_DIR_MAP, days_since, is_vector_available,
+        memory_lock, relpath_posix, same_relpath, normalize_text_key,
+        DEDUP_SIMILARITY
     )
-    from .vector_store import add_memory_vector
+    from .vector_store import add_memory_vector, find_similar_memories
 except ImportError:
     from _base import (
         get_entry_file_path, read_memory_file, write_memory_file,
         read_memory_index, write_memory_index,
         now_iso, now_date_str, generate_entry_id, MEMORY_DIR,
         ARCHIVE_THRESHOLD, ARCHIVE_AGE_DAYS, ARCHIVE_AGE_DAYS_FALLBACK,
-        CATEGORY_DIR_MAP, days_since, is_vector_available
+        CATEGORY_DIR_MAP, days_since, is_vector_available,
+        memory_lock, relpath_posix, same_relpath, normalize_text_key,
+        DEDUP_SIMILARITY
     )
-    from vector_store import add_memory_vector
+    from vector_store import add_memory_vector, find_similar_memories
 
 
 def _generate_summary(content: str, max_len: int = 80) -> str:
@@ -125,7 +129,7 @@ def _check_archiving(category: str, memory_dir: Path = None) -> dict:
                 md_file.rename(dest)
                 count += 1
                 try:
-                    moved.append(str(md_file.relative_to(mem_dir)))
+                    moved.append(relpath_posix(md_file, mem_dir))
                 except ValueError:
                     pass
         return count, moved
@@ -146,7 +150,7 @@ def _check_archiving(category: str, memory_dir: Path = None) -> dict:
         cat_dir_name = CATEGORY_DIR_MAP.get(category, category)
         for old_rel_path in archived_paths:
             for entry in index_fm.get("entries", []):
-                if isinstance(entry, dict) and entry.get("path") == old_rel_path:
+                if isinstance(entry, dict) and same_relpath(entry.get("path", ""), old_rel_path):
                     # 更新路径指向 archive 子目录
                     file_name = Path(old_rel_path).name
                     entry["path"] = f"{cat_dir_name}/archive/{file_name}"
@@ -165,10 +169,16 @@ def add_memory(
     project_name: str = None,
     emphasis: bool = False,
     mention_count: int = 0,
+    allow_dedup: bool = True,
     memory_dir: Path = None
 ) -> dict:
     """
     添加一条新记忆，生成独立文件并更新索引。
+
+    默认开启去重：新内容与已有 habit/skill 记忆重复（归一化后精确匹配，
+    或向量相似度 >= DEDUP_SIMILARITY）时不新建文件，而是合并进已有记忆
+    （无损追加正文，并按需提升 mention_count/emphasis/优先级）。
+    传 allow_dedup=False（CLI 的 --no-dedup）强制新建独立文件。
 
     参数:
         category: habit/skill/project
@@ -180,36 +190,187 @@ def add_memory(
         project_name: 项目名称(category=project时必填)
         emphasis: 是否被用户主动强调/标记重点（影响加权检索权重）
         mention_count: 被提及的次数（skill类别使用，>=3视为反复提及）
+        allow_dedup: 是否允许自动去重合并（False 强制新建）
         memory_dir: 自定义记忆目录(默认使用配置值)
 
     返回:
         {"success": True, "entry_id": "...", "file_path": "..."}
+        去重合并时返回 {"success": True, "deduplicated": True, "merged_into": {...}}
     """
+    mem_dir = memory_dir or MEMORY_DIR
+    with memory_lock(mem_dir):
+        return _add_memory_impl(
+            category=category, content=content, priority=priority,
+            tags=tags, expires=expires, related=related,
+            project_name=project_name, emphasis=emphasis,
+            mention_count=mention_count, allow_dedup=allow_dedup,
+            mem_dir=mem_dir,
+        )
+
+
+def _scan_existing_entries(mem_dir: Path) -> list:
+    """
+    扫描所有类别目录（不含 archive/、deleted/ 子目录）下的记忆文件，
+    返回供 entry_id 生成与去重匹配共用的条目信息列表。
+    """
+    dir_to_category = {v: k for k, v in CATEGORY_DIR_MAP.items()}
+    entries = []
+    for dir_name, category in dir_to_category.items():
+        cat_dir = mem_dir / dir_name
+        if not cat_dir.exists():
+            continue
+        for f in cat_dir.glob("*.md"):
+            fm, body = read_memory_file(f)
+            if not fm or not fm.get("entry_id"):
+                continue
+            try:
+                file_rel = relpath_posix(f, mem_dir)
+            except ValueError:
+                continue
+            entries.append({
+                "entry_id": fm["entry_id"],
+                "category": fm.get("category") or category,
+                "file_rel": file_rel,
+                "summary": fm.get("summary", ""),
+                "summary_norm": normalize_text_key(fm.get("summary", "")),
+                "body": body,
+                "body_norm": normalize_text_key(body),
+            })
+    return entries
+
+
+def _find_duplicate(existing_entries: list, category: str, content: str,
+                    summary: str, mem_dir: Path):
+    """
+    查找与新内容重复的已有记忆（仅 habit/skill 参与去重，project 本身就是单文件追加）。
+    两级匹配：
+      1. 精确匹配：归一化后与已有摘要相同，或已包含在正文中
+      2. 向量匹配：语义相似度 >= DEDUP_SIMILARITY（chromadb 可用时），
+         且召回条目仍存在于文件扫描结果中（排除已归档/已删除的）
+    """
+    if category not in ("habit", "skill"):
+        return None
+
+    key = normalize_text_key(content)
+    if key:
+        for e in existing_entries:
+            if e["category"] != category:
+                continue
+            if e["summary_norm"] == key or key in e["body_norm"]:
+                return e
+
+    if is_vector_available():
+        res = find_similar_memories(
+            f"{summary}\n{content}", n_results=5, category=category, memory_dir=mem_dir
+        )
+        if res.get("success") and not res.get("skipped"):
+            scanned_ids = {e["entry_id"] for e in existing_entries if e["category"] == category}
+            for m in res.get("matches", []):
+                if m.get("similarity", 0) >= DEDUP_SIMILARITY and m.get("entry_id") in scanned_ids:
+                    for e in existing_entries:
+                        if e["entry_id"] == m["entry_id"] and e["category"] == category:
+                            return e
+    return None
+
+
+_PRIORITY_ORDER = {"low": 0, "medium": 1, "high": 2}
+
+
+def _merge_into_existing(existing: dict, content: str, category: str,
+                         priority: str, emphasis: bool, mem_dir: Path) -> dict:
+    """
+    将新内容合并进已有记忆：无损追加正文，按需提升 mention_count（skill）、
+    emphasis 和优先级，并同步总目录索引与向量库文档。
+    """
+    file_abs = mem_dir / existing["file_rel"]
+    fm, body = read_memory_file(file_abs)
+    now = now_iso()
+
+    if category == "skill":
+        fm["mention_count"] = int(fm.get("mention_count", 0) or 0) + 1
+    if emphasis:
+        fm["emphasis"] = True
+    if _PRIORITY_ORDER.get(priority, 1) > _PRIORITY_ORDER.get(fm.get("priority", "medium"), 1):
+        fm["priority"] = priority
+    fm["last_modified"] = now
+
+    # 内容已存在（逐字重复）时不重复追加，保证多次记录同一条偏好不会膨胀正文
+    new_norm = normalize_text_key(content)
+    if new_norm and new_norm not in normalize_text_key(body):
+        body = body.rstrip() + "\n\n---\n\n" + content.strip() + "\n"
+    write_memory_file(file_abs, fm, body)
+
+    index_fm = read_memory_index(memory_dir=mem_dir)
+    for entry in index_fm.get("entries", []):
+        if isinstance(entry, dict) and same_relpath(entry.get("path", ""), existing["file_rel"]):
+            entry["last_modified"] = now
+            entry["emphasis"] = fm.get("emphasis", entry.get("emphasis", False))
+            if "mention_count" in fm:
+                entry["mention_count"] = fm["mention_count"]
+    index_fm["last_modified"] = now
+    write_memory_index(index_fm, memory_dir=mem_dir)
+
+    if is_vector_available():
+        add_memory_vector(
+            entry_id=existing["entry_id"],
+            file_path=existing["file_rel"],
+            summary=fm.get("summary", ""),
+            content=body.strip(),
+            category=category,
+            priority=fm.get("priority", "medium"),
+            tags=fm.get("tags", []) or [],
+            emphasis=fm.get("emphasis", False),
+            mention_count=fm.get("mention_count", 0),
+            date=fm.get("date", ""),
+            expires=fm.get("expires"),
+            memory_dir=mem_dir,
+        )
+
+    return {
+        "success": True,
+        "deduplicated": True,
+        "merged_into": {"file_path": existing["file_rel"], "entry_id": existing["entry_id"]},
+        "message": f"新内容与已有记忆高度相似，已合并至 {existing['file_rel']}（--no-dedup 可强制新建）",
+    }
+
+
+def _add_memory_impl(
+    category: str,
+    content: str,
+    priority: str,
+    tags: list,
+    expires: str,
+    related: list,
+    project_name: str,
+    emphasis: bool,
+    mention_count: int,
+    allow_dedup: bool,
+    mem_dir: Path
+) -> dict:
     tags = tags or []
     related = related or []
 
-    # 1. 生成摘要和 entry_id
+    # 1. 生成摘要
     summary = _generate_summary(content)
 
-    # 先生成 entry_id（需要检查所有类别的已有文件，避免跨类别ID冲突）
-    mem_dir = memory_dir or MEMORY_DIR
-    existing_ids = []
-    for cat_name in CATEGORY_DIR_MAP.values():
-        cat_dir = mem_dir / cat_name
-        if cat_dir.exists():
-            for f in cat_dir.glob("*.md"):
-                fm, _ = read_memory_file(f)
-                if fm and fm.get("entry_id"):
-                    existing_ids.append(fm["entry_id"])
+    # 2. 扫描已有记忆（entry_id 生成与去重共用一次扫描，避免跨类别ID冲突）
+    existing_entries = _scan_existing_entries(mem_dir)
+    existing_ids = [e["entry_id"] for e in existing_entries]
+
+    # 3. 去重检查
+    if allow_dedup:
+        duplicate = _find_duplicate(existing_entries, category, content, summary, mem_dir)
+        if duplicate:
+            return _merge_into_existing(duplicate, content, category, priority, emphasis, mem_dir)
 
     entry_id = generate_entry_id(existing_ids)
     now = now_iso()
     date_header = now_date_str()
 
-    # 2. 生成文件路径
+    # 4. 生成文件路径
     file_path = get_entry_file_path(category, entry_id, summary, project_name, memory_dir=mem_dir)
 
-    # 3. 对于项目类型，如果文件已存在则追加
+    # 5. 对于项目类型，如果文件已存在则追加
     if category == "project" and file_path.exists():
         fm, body = read_memory_file(file_path)
         # 在正文顶部追加新内容
@@ -266,11 +427,11 @@ def add_memory(
 
         write_memory_file(file_path, fm, body)
 
-    # 5. 更新总目录
-    file_rel_path = str(file_path.relative_to(mem_dir))
+    # 6. 更新总目录
+    file_rel_path = relpath_posix(file_path, mem_dir)
     _update_index_for_entry(file_rel_path, category, summary, priority, tags, entry_id, project_name, emphasis, mention_count, memory_dir=mem_dir)
 
-    # 5.5 同步写入向量库（可选，chromadb 未安装时跳过）
+    # 6.5 同步写入向量库（可选，chromadb 未安装时跳过）
     vector_notice = None
     if is_vector_available():
         vector_result = add_memory_vector(
@@ -290,7 +451,7 @@ def add_memory(
         if not vector_result.get("success") and not vector_result.get("skipped"):
             vector_notice = f"向量库写入失败: {vector_result.get('error', '未知错误')}"
 
-    # 6. 归档检查
+    # 7. 归档检查
     cat_dir = mem_dir / CATEGORY_DIR_MAP.get(category, category)
     if cat_dir.exists():
         file_count = len(list(cat_dir.glob("*.md")))
@@ -337,6 +498,7 @@ if __name__ == "__main__":
     parser.add_argument("--related", "-r", default=None, help="关联文件路径，逗号分隔")
     parser.add_argument("--emphasis", action="store_true", help="标记为用户主动强调/重点")
     parser.add_argument("--mention-count", type=int, default=0, help="提及次数(skill类别，>=3视为反复提及)")
+    parser.add_argument("--no-dedup", action="store_true", help="禁用自动去重，强制新建独立文件")
     parser.add_argument("--json", action="store_true", help="JSON格式输出")
 
     args = parser.parse_args()
@@ -352,7 +514,8 @@ if __name__ == "__main__":
         related=related_list,
         project_name=args.project_name,
         emphasis=args.emphasis,
-        mention_count=args.mention_count
+        mention_count=args.mention_count,
+        allow_dedup=not args.no_dedup
     )
 
     print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else result)
