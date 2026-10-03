@@ -22,11 +22,15 @@ except ImportError:
     HAS_YAML = False
 
 # 尝试检测 chromadb（不在此导入，仅检测可用性，避免强依赖）
-try:
-    import importlib.util
-    importlib.util.find_spec("chromadb")
-    HAS_CHROMADB = True
-except ImportError:
+# 注意: find_spec 对未安装的顶层模块返回 None 而不是抛出 ImportError，
+# 必须显式判断 None，否则未安装 chromadb 时也会被误判为可用，
+# 导致 search 走向量模式且永不降级、结果恒为空。
+import importlib.util
+HAS_CHROMADB = importlib.util.find_spec("chromadb") is not None
+
+# 环境变量 SMM_NO_VECTOR=1 可全局禁用向量检索（强制关键字模式），
+# 优先级高于 chromadb 是否可用；也用于测试与离线环境。
+if os.environ.get("SMM_NO_VECTOR", "").strip().lower() in ("1", "true", "yes"):
     HAS_CHROMADB = False
 
 
@@ -231,8 +235,13 @@ def _get_default_memory_dir() -> Path:
 
 
 # 自动设置记忆目录（全局共享，不随项目路径变化）
+# 可通过环境变量 SMM_MEMORY_DIR 显式指定记忆目录（便于测试和多套记忆隔离），
+# 优先级高于自动检测。
 _detected = _detect_agent_memory_dir()
 MEMORY_DIR = _detected if _detected else _get_default_memory_dir()
+_env_memory_dir = os.environ.get("SMM_MEMORY_DIR")
+if _env_memory_dir:
+    MEMORY_DIR = Path(_env_memory_dir).expanduser()
 
 
 # ============================================================
@@ -254,33 +263,143 @@ class YAMLParser:
             return YAMLParser._fallback_parse(text)
 
     @staticmethod
-    def _fallback_parse(text: str) -> Dict[str, Any]:
-        """无PyYAML时的简易解析器（支持基础结构）"""
-        result = {}
-        in_front_matter = False
-        lines = text.split('\n')
-        for line in lines:
-            line = line.strip()
-            if line == '---':
-                in_front_matter = not in_front_matter
+    def _parse_scalar(value: str) -> Any:
+        """解析单个标量值或 flow 风格列表（回退模式）"""
+        value = value.strip()
+        if value.startswith('[') and value.endswith(']'):
+            inner = value[1:-1].strip()
+            if not inner:
+                return []
+            items = [v.strip() for v in inner.split(',')]
+            return [YAMLParser._parse_scalar(v) for v in items if v]
+        if value.lower() in ('true', 'false'):
+            return value.lower() == 'true'
+        if value in ('null', '~', ''):
+            return None
+        if re.match(r'^-?\d+$', value):
+            return int(value)
+        if re.match(r'^-?\d+\.\d+$', value):
+            return float(value)
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            body = value[1:-1]
+            if value[0] == '"':
+                body = body.replace('\\"', '"').replace('\\\\', '\\')
+            else:
+                body = body.replace("''", "'")
+            return body
+        return value
+
+    @staticmethod
+    def _parse_block_list(lines: List[str], start: int) -> Tuple[List[Any], int]:
+        """
+        解析 "- ..." 形式的块风格列表，返回 (items, 停止行索引)。
+        支持两种形态：
+          1. 列表套扁平字典（如 memory_index.md 的 entries）
+          2. 纯标量列表（如 PyYAML dump 出的 tags / related_files 块列表）
+        """
+        n = len(lines)
+        first_body = lines[start].strip()[2:].strip()
+
+        # 纯标量列表：首个条目不含 "key:" 结构
+        if ':' not in first_body:
+            items: List[Any] = []
+            i = start
+            while i < n:
+                stripped = lines[i].strip()
+                if not stripped:
+                    i += 1
+                    continue
+                if not stripped.startswith('- '):
+                    break
+                items.append(YAMLParser._parse_scalar(stripped[2:]))
+                i += 1
+            return items, i
+
+        items = []
+        i = start
+        while i < n:
+            line = lines[i]
+            stripped = line.strip()
+            if not stripped:
+                i += 1
                 continue
-            if in_front_matter and ':' in line:
-                key, _, value = line.partition(':')
-                key = key.strip()
-                value = value.strip().strip('"').strip("'")
-                if value.startswith('['):
-                    items = re.findall(r'[\w\u4e00-\u9fff\-/.#]+', value)
+            if not stripped.startswith('- '):
+                break
+            item_indent = len(line) - len(line.lstrip(' '))
+            item: Dict[str, Any] = {}
+            body = stripped[2:].strip()
+            last_key = None
+            if ':' in body:
+                k, _, v = body.partition(':')
+                last_key = k.strip()
+                item[last_key] = YAMLParser._parse_scalar(v)
+            i += 1
+            # 同一条目的后续内容：缩进比 "- " 行更深的行
+            while i < n:
+                cont = lines[i]
+                cont_stripped = cont.strip()
+                cont_indent = len(cont) - len(cont.lstrip(' '))
+                if not cont_stripped:
+                    i += 1
+                    continue
+                if cont_indent <= item_indent:
+                    break
+                if cont_stripped.startswith('- '):
+                    # 嵌套的块风格标量列表（PyYAML dump 的 tags 等字段）
+                    if last_key is not None:
+                        if not isinstance(item.get(last_key), list):
+                            item[last_key] = []
+                        item[last_key].append(YAMLParser._parse_scalar(cont_stripped[2:]))
+                    i += 1
+                    continue
+                if ':' in cont_stripped:
+                    k, _, v = cont_stripped.partition(':')
+                    last_key = k.strip()
+                    item[last_key] = YAMLParser._parse_scalar(v)
+                i += 1
+            items.append(item)
+        return items, i
+
+    @staticmethod
+    def _fallback_parse(text: str) -> Dict[str, Any]:
+        """
+        无PyYAML时的简易解析器。
+        支持本 Skill 实际使用的全部结构：顶层键值对、flow 风格列表 [a, b]、
+        以及 memory_index.md 中 entries 这类「列表套扁平字典」的块结构。
+        """
+        result: Dict[str, Any] = {}
+        cleaned = []
+        for raw in text.split('\n'):
+            stripped = raw.strip()
+            if not stripped or stripped == '---':
+                continue
+            cleaned.append(raw.rstrip())
+
+        i = 0
+        n = len(cleaned)
+        while i < n:
+            line = cleaned[i]
+            stripped = line.strip()
+            if stripped.startswith('- ') or ':' not in stripped:
+                i += 1
+                continue
+            key, _, value = stripped.partition(':')
+            key = key.strip()
+            value = value.strip()
+            if value == '':
+                # 空值：向后看，若下一行以 "- " 开头则按字典列表解析
+                j = i + 1
+                while j < n and cleaned[j].strip() == '':
+                    j += 1
+                if j < n and cleaned[j].strip().startswith('- '):
+                    items, i = YAMLParser._parse_block_list(cleaned, j)
                     result[key] = items
-                elif value.lower() in ('true', 'false'):
-                    result[key] = value.lower() == 'true'
-                elif value == 'null' or value == '':
-                    result[key] = None
-                elif re.match(r'^-?\d+$', value):
-                    result[key] = int(value)
-                elif re.match(r'^-?\d+\.\d+$', value):
-                    result[key] = float(value)
-                else:
-                    result[key] = value
+                    continue
+                result[key] = None
+                i += 1
+            else:
+                result[key] = YAMLParser._parse_scalar(value)
+                i += 1
         return result
 
     @staticmethod
@@ -292,31 +411,50 @@ class YAMLParser:
             return YAMLParser._fallback_dump(data)
 
     @staticmethod
+    def _format_scalar(value: Any) -> str:
+        """将标量或 flow 列表格式化为 YAML 值文本（回退模式，与 _parse_scalar 配套）"""
+        if isinstance(value, bool):
+            return 'true' if value else 'false'
+        if value is None:
+            return 'null'
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, list):
+            return '[' + ', '.join(YAMLParser._format_scalar(v) for v in value) + ']'
+        text = str(value)
+        needs_quote = (
+            text == ''
+            or text.lower() in ('true', 'false', 'null', '~')
+            or bool(re.match(r'^-?[\d.]+$', text))
+            or any(c in text for c in [':', '[', ']', '{', '}', '#', ',', '\n', '"', "'"])
+        )
+        if needs_quote:
+            return '"' + text.replace('\\', '\\\\').replace('"', '\\"') + '"'
+        return text
+
+    @staticmethod
     def _fallback_dump(data: Dict[str, Any], indent: int = 0) -> str:
-        """简易YAML生成"""
+        """简易YAML生成（块风格，与 _fallback_parse 保持双向兼容）"""
         lines = []
         prefix = "  " * indent
         for key, value in data.items():
             if isinstance(value, dict):
                 lines.append(f"{prefix}{key}:")
                 lines.append(YAMLParser._fallback_dump(value, indent + 1))
-            elif isinstance(value, list):
-                formatted_items = []
+            elif isinstance(value, list) and value and all(isinstance(v, dict) for v in value):
+                # 字典列表输出为块风格（entries 结构），保证可被 _fallback_parse 读回
+                lines.append(f"{prefix}{key}:")
                 for item in value:
-                    if isinstance(item, dict):
-                        item_str = "{ " + ", ".join(f"{k}: {v}" for k, v in item.items()) + " }"
-                        formatted_items.append(item_str)
+                    item_lines = []
+                    for j, (k, v) in enumerate(item.items()):
+                        item_prefix = f"{prefix}  - " if j == 0 else f"{prefix}    "
+                        item_lines.append(f"{item_prefix}{k}: {YAMLParser._format_scalar(v)}")
+                    if item_lines:
+                        lines.extend(item_lines)
                     else:
-                        formatted_items.append(f'"{item}"')
-                lines.append(f"{prefix}{key}: [{', '.join(formatted_items)}]")
-            elif isinstance(value, bool):
-                lines.append(f"{prefix}{key}: {'true' if value else 'false'}")
-            elif value is None:
-                lines.append(f"{prefix}{key}: null")
-            elif isinstance(value, str) and any(c in value for c in [':', '[', '{', '#', '\n']):
-                lines.append(f'{prefix}{key}: "{value}"')
+                        lines.append(f"{prefix}  - {{}}")
             else:
-                lines.append(f"{prefix}{key}: {value}")
+                lines.append(f"{prefix}{key}: {YAMLParser._format_scalar(value)}")
         return '\n'.join(lines)
 
 
@@ -325,8 +463,15 @@ def extract_front_matter(file_content: str) -> Tuple[Dict[str, Any], str]:
     从文件内容中提取YAML front matter和正文
     返回: (front_matter_dict, body_text)
     """
+    if not file_content:
+        return {}, ""
+    # 统一换行符，避免 Windows CRLF 影响解析
+    content = file_content.replace('\r\n', '\n').replace('\r', '\n')
     pattern = r'^---\s*\n(.*?)\n---\s*\n(.*)$'
-    match = re.match(pattern, file_content, re.DOTALL)
+    match = re.match(pattern, content, re.DOTALL)
+    if not match:
+        # 兼容历史遗留格式：闭合 --- 与末行内容粘连（如 "emphasis: true---"）
+        match = re.match(r'^---\s*\n(.*?)---\s*\n(.*)$', content, re.DOTALL)
     if match:
         fm_text = match.group(1)
         body = match.group(2)
@@ -337,6 +482,10 @@ def extract_front_matter(file_content: str) -> Tuple[Dict[str, Any], str]:
 def build_front_matter(fm_dict: Dict[str, Any]) -> str:
     """构建完整的front matter字符串"""
     yaml_text = YAMLParser.dump(fm_dict)
+    # 内置简易 dump 不带末尾换行，必须补上，否则闭合 --- 会与内容粘连，
+    # 导致 extract_front_matter 无法识别边界（索引读写整体失效）
+    if yaml_text and not yaml_text.endswith('\n'):
+        yaml_text += '\n'
     return f"---\n{yaml_text}---\n\n"
 
 
@@ -486,3 +635,44 @@ def _init_memory_index() -> Dict[str, Any]:
         "last_modified": now_iso(),
         "entries": []
     }
+
+
+# ============================================================
+# 路径安全与状态统计
+# ============================================================
+
+def resolve_within_memory_dir(file_path: str, memory_dir: Path = None) -> Optional[Path]:
+    """
+    将相对路径解析到记忆目录内，防止路径越界（如 ../../ 等）。
+    返回解析后的绝对路径；路径越界时返回 None。
+    """
+    mem_dir = (memory_dir or MEMORY_DIR).resolve()
+    target = (mem_dir / file_path).resolve()
+    try:
+        target.relative_to(mem_dir)
+    except ValueError:
+        return None
+    return target
+
+
+def get_memory_stats(memory_dir: Path = None) -> dict:
+    """收集记忆库统计信息（供 cli.py stats 使用）"""
+    mem_dir = memory_dir or MEMORY_DIR
+    ensure_memory_dir(mem_dir)
+    stats = {
+        "memory_dir": str(mem_dir),
+        "categories": {},
+        "index_entries": 0,
+    }
+    for category, dir_name in CATEGORY_DIR_MAP.items():
+        cat_dir = mem_dir / dir_name
+        archive_dir = cat_dir / "archive"
+        stats["categories"][category] = {
+            "active_files": len(list(cat_dir.glob("*.md"))) if cat_dir.exists() else 0,
+            "archived_files": len(list(archive_dir.glob("*.md"))) if archive_dir.exists() else 0,
+        }
+    index_fm = read_memory_index(memory_dir=mem_dir)
+    stats["index_entries"] = len(index_fm.get("entries", []))
+    stats["pyyaml"] = HAS_YAML
+    stats["chromadb"] = HAS_CHROMADB
+    return stats

@@ -255,6 +255,12 @@ def add_memory(
         if category == "project" and project_name:
             fm["project_name"] = project_name
             fm["status"] = "active"
+            # 第一条决策也计入 decision_log（与 system.md 中的项目文件规范一致）
+            fm["decision_log"] = [{
+                "date": now,
+                "decision": summary,
+                "entry_id": entry_id,
+            }]
 
         body = content + "\n"
 
@@ -328,12 +334,14 @@ if __name__ == "__main__":
     parser.add_argument("--tags", "-t", default="", help="标签，逗号分隔")
     parser.add_argument("--expires", "-e", default=None, help="过期日期 ISO 8601")
     parser.add_argument("--project-name", default=None, help="项目名称(project类别必填)")
+    parser.add_argument("--related", "-r", default=None, help="关联文件路径，逗号分隔")
     parser.add_argument("--emphasis", action="store_true", help="标记为用户主动强调/重点")
     parser.add_argument("--mention-count", type=int, default=0, help="提及次数(skill类别，>=3视为反复提及)")
     parser.add_argument("--json", action="store_true", help="JSON格式输出")
 
     args = parser.parse_args()
     tags_list = [t.strip() for t in args.tags.split(",")] if args.tags else []
+    related_list = [t.strip() for t in args.related.split(",")] if args.related else None
 
     result = add_memory(
         category=args.category,
@@ -341,6 +349,7 @@ if __name__ == "__main__":
         priority=args.priority,
         tags=tags_list,
         expires=args.expires,
+        related=related_list,
         project_name=args.project_name,
         emphasis=args.emphasis,
         mention_count=args.mention_count

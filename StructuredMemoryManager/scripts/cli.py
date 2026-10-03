@@ -11,6 +11,7 @@ StructuredMemoryManager - 统一命令入口 (cli.py)
   python cli.py read   <file_path>
   python cli.py confirm <file_path> <entry_id> <action> [options]
   python cli.py rebuild
+  python cli.py stats
 
 所有命令支持 --json 参数输出结构化 JSON。
 """
@@ -20,17 +21,29 @@ import json
 import argparse
 from pathlib import Path
 
+# Windows 控制台默认 GBK 编码，输出含 emoji 等字符的 JSON 时会抛
+# UnicodeEncodeError；统一将标准流切到 UTF-8（不支持 reconfigure 的环境静默跳过）。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
+
 # 支持独立运行和包导入
 try:
     from .add_memory import add_memory
     from .search_memory import search_memory, read_memory
     from .confirm_memory import confirm_memory
     from .rebuild_index import rebuild_index
+    from ._base import get_memory_stats, is_vector_available
+    from .vector_store import get_vector_store_stats
 except ImportError:
     from add_memory import add_memory
     from search_memory import search_memory, read_memory
     from confirm_memory import confirm_memory
     from rebuild_index import rebuild_index
+    from _base import get_memory_stats, is_vector_available
+    from vector_store import get_vector_store_stats
 
 
 def _parse_tags(tags_str: str) -> list:
@@ -86,6 +99,17 @@ def cmd_confirm(args) -> dict:
 def cmd_rebuild(args) -> dict:
     """执行 rebuild_index 命令"""
     return rebuild_index()
+
+
+def cmd_stats(args) -> dict:
+    """执行 stats 命令：输出记忆库健康状态"""
+    stats = get_memory_stats()
+    if is_vector_available():
+        stats["vector_store"] = get_vector_store_stats()
+    else:
+        stats["vector_store"] = {"available": False,
+                                 "reason": "chromadb 未安装或已被 SMM_NO_VECTOR 禁用"}
+    return stats
 
 
 def _add_json_flag(sub_parser):
@@ -167,6 +191,10 @@ def main():
     p_rebuild = subparsers.add_parser("rebuild", help="全量重建总目录索引")
     _add_json_flag(p_rebuild)
 
+    # ── stats ────────────────────────────────────────
+    p_stats = subparsers.add_parser("stats", help="查看记忆库状态（文件数、索引条数、向量库可用性）")
+    _add_json_flag(p_stats)
+
     args = parser.parse_args()
 
     if not args.command:
@@ -180,6 +208,7 @@ def main():
         "read": cmd_read,
         "confirm": cmd_confirm,
         "rebuild": cmd_rebuild,
+        "stats": cmd_stats,
     }
 
     result = dispatch[args.command](args)

@@ -11,9 +11,7 @@ StructuredMemoryManager - search_memory 工具方法
 可独立调用：python scripts/search_memory.py "查询关键词" [--category habit] [--high-priority]
 """
 
-import sys
 import json
-import re
 import argparse
 from pathlib import Path
 
@@ -23,6 +21,7 @@ try:
         read_memory_index, read_memory_file, is_expired,
         MEMORY_DIR, CATEGORY_DIR_MAP,
         compute_weight, resolve_conflict, is_vector_available,
+        resolve_within_memory_dir,
     )
     from .vector_store import query_memory_vector, list_all_vector_memories
 except ImportError:
@@ -30,6 +29,7 @@ except ImportError:
         read_memory_index, read_memory_file, is_expired,
         MEMORY_DIR, CATEGORY_DIR_MAP,
         compute_weight, resolve_conflict, is_vector_available,
+        resolve_within_memory_dir,
     )
     from vector_store import query_memory_vector, list_all_vector_memories
 
@@ -49,7 +49,9 @@ def read_memory(
         {"entry_id", "category", "priority", "tags", "summary", "content", ...}
     """
     mem_dir = memory_dir or MEMORY_DIR
-    abs_path = mem_dir / file_path
+    abs_path = resolve_within_memory_dir(file_path, mem_dir)
+    if abs_path is None:
+        return {"success": False, "error": f"非法路径（越出记忆目录）: {file_path}"}
 
     if not abs_path.exists():
         return {"success": False, "error": f"文件不存在: {file_path}"}
@@ -118,7 +120,18 @@ def search_memory(
 
     # ============ 向量检索模式 ============
     if vector_enabled:
-        return _search_via_vector(
+        vector_results = _search_via_vector(
+            query=query,
+            category_filter=category_filter,
+            tag_filter=tag_filter,
+            high_priority_only=high_priority_only,
+            memory_dir=mem_dir,
+        )
+        if vector_results:
+            return vector_results
+        # 向量库为空或查询失败（如索引未同步、嵌入模型缺失）时，
+        # 自动降级到关键字检索，避免"chromadb 已装但检索恒为空"。
+        return _search_via_keyword(
             query=query,
             category_filter=category_filter,
             tag_filter=tag_filter,

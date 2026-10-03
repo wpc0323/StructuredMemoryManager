@@ -49,7 +49,8 @@ def rebuild_index(memory_dir: Path = None) -> dict:
             continue
 
         for md_file in cat_dir.rglob("*.md"):
-            # 跳过归档子目录中的文件（但仍索引）
+            # rglob 会同时覆盖子目录（含 archive/），归档文件也会被索引，
+            # 保证归档后的记忆仍可检索
             rel_path = str(md_file.relative_to(mem_dir))
 
             fm, body = read_memory_file(md_file)

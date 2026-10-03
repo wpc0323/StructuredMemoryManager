@@ -1,6 +1,6 @@
 ---
 name: StructuredMemoryManager
-version: 3.0.0
+version: 3.1.0
 description: "【每次新对话开始时必须首先调用】预加载用户偏好、习惯、历史决策等高优记忆，确保回复符合用户要求。也用于记录新偏好/习惯、保存任务总结、存储项目决策。"
 license: MIT
 category: memory-management
@@ -25,7 +25,11 @@ dependencies:
       version: ">=0.5.0"
       optional: true
       fallback: "降级为关键字匹配检索"
-      note: "首次使用时自动下载嵌入模型 all-MiniLM-L6-v2（约86MB）到 .cache/ 目录；可通过 scripts/download_model.py 从 hf-mirror.com 加速下载"
+      note: "首次使用时自动下载嵌入模型 all-MiniLM-L6-v2（约86MB）到 .cache/ 目录；可通过 scripts/download_model.py 从 hf-mirror.com 加速下载。设置环境变量 SMM_NO_VECTOR=1 可全局禁用向量检索"
+
+environment:
+  SMM_MEMORY_DIR: "可选。显式指定记忆目录，覆盖自动检测（便于多套记忆隔离与测试）"
+  SMM_NO_VECTOR: "可选。设为 1 时全局禁用向量检索，强制关键字模式"
 
 permissions:
   - read_write_workspace
@@ -87,6 +91,7 @@ Agent 加载时应定位 `cli.py` 的绝对路径，后续所有调用均使用�
 | 查看某条记忆完整内容 | `python "{CLI}" read "habits/xxx.md" --json` |
 | 确认/更新记忆状态 | `python "{CLI}" confirm "<path>" "<id>" <action> --json` |
 | 索引不一致时修复 | `python "{CLI}" rebuild --json` |
+| 查看记忆库健康状态 | `python "{CLI}" stats --json` |
 
 ## 加载指令
 

@@ -17,13 +17,15 @@ from pathlib import Path
 try:
     from ._base import (
         read_memory_file, write_memory_file, now_iso,
-        read_memory_index, write_memory_index, MEMORY_DIR, is_vector_available
+        read_memory_index, write_memory_index, MEMORY_DIR, is_vector_available,
+        resolve_within_memory_dir
     )
     from .vector_store import update_memory_metadata
 except ImportError:
     from _base import (
         read_memory_file, write_memory_file, now_iso,
-        read_memory_index, write_memory_index, MEMORY_DIR, is_vector_available
+        read_memory_index, write_memory_index, MEMORY_DIR, is_vector_available,
+        resolve_within_memory_dir
     )
     from vector_store import update_memory_metadata
 
@@ -61,7 +63,9 @@ def confirm_memory(
         {"success": True/False, "message": "..."}
     """
     mem_dir = memory_dir or MEMORY_DIR
-    abs_path = mem_dir / file_path
+    abs_path = resolve_within_memory_dir(file_path, mem_dir)
+    if abs_path is None:
+        return {"success": False, "error": f"非法路径（越出记忆目录）: {file_path}"}
 
     if not abs_path.exists():
         return {"success": False, "error": f"文件不存在: {file_path}"}

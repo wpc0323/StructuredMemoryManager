@@ -1,7 +1,7 @@
 # StructuredMemoryManager
 
 > 让 Agent 告别"失忆"和"模糊记忆"的结构化长期记忆管理 Skill。
-> v3.0 加入向量数据库（ChromaDB）语义检索能力。
+> v3.0 加入向量数据库（ChromaDB）语义检索能力；v3.1 修复降级检索与 YAML 回退解析缺陷，新增 `stats` 健康检查、pytest 测试套件与 CI。
 
 ## 简介
 
@@ -13,10 +13,13 @@ StructuredMemoryManager 是一个全面接管 Agent 记忆生成、存储、索�
 - **★ 向量语义检索**（v3.0）：基于 ChromaDB + all-MiniLM-L6-v2 嵌入模型，支持自然语言查询和语义相似匹配
 - **加权检索**：向量相似度 × 分类权重 × emphasis × priority × recency 综合排序
 - **双模式自动降级**：chromadb 不可用时自动回退到关键字匹配检索
+- **★ 检索空结果自动回退**（v3.1）：向量库为空或查询失败时自动改用关键字检索，不再返回空结果
 - **强调与提及追踪**：用户主动强调的内容和反复提及的技能获得最高权重
 - **优先级与保鲜期**：高优记忆永不丢失，临时信息自动过期
 - **自动归档**：超阈值时自动归档低优先级旧条目
 - **统一 CLI 入口**：所有操作通过 `cli.py` 执行，Agent 无需直接调用 Python 函数
+- **stats 健康检查**（v3.1）：一条命令查看记忆库文件数、索引条数与向量库状态
+- **pytest 测试套件 + CI**（v3.1）：覆盖回退解析、加权检索、归档与 CLI 端到端
 
 ## 文件结构
 
@@ -46,7 +49,10 @@ StructuredMemoryManager/
 │   └── best_practices.md      # 设计思路与最佳实践
 ├── README.md                  # 本文件
 ├── LICENSE                    # MIT 许可证
-└── .gitignore                 # Git 忽略规则（含 .cache/ 排除）
+├── .gitignore                 # Git 忽略规则（含 .cache/、__pycache__/ 排除）
+├── tests/                     # pytest 测试套件
+└── .github/
+    └── workflows/ci.yml       # CI（Python 3.9~3.12 + 无PyYAML回退模式）
 ```
 
 ## 安装
@@ -93,6 +99,14 @@ Skill 首次加载时会自动：
 3. `~/.agent-memory/StructuredMemoryManager/`（默认）
 
 所有项目、所有对话共享同一份记忆文件。
+
+### 环境变量
+
+| 变量 | 说明 |
+|------|------|
+| `SMM_MEMORY_DIR` | 显式指定记忆目录，覆盖自动检测（便于多套记忆隔离与测试） |
+| `SMM_NO_VECTOR` | 设为 `1` 时全局禁用向量检索，强制关键字模式（离线环境/排障用） |
+| `HF_ENDPOINT` | HuggingFace 镜像地址，默认 `https://hf-mirror.com`（download_model.py 使用） |
 
 ### 验证安装
 
@@ -195,6 +209,7 @@ python "{CLI}" read "habits/xxx.md" --json
 | `emphasize` | `python "{CLI}" confirm "<path>" "<id>" emphasize --json` | 标记为用户主动强调/重点 |
 | `de_emphasize` | `python "{CLI}" confirm "<path>" "<id>" de_emphasize --json` | 取消强调标记 |
 | `bump_mention` | `python "{CLI}" confirm "<path>" "<id>" bump_mention --json` | 增加提及次数 |
+| `stats` | `python "{CLI}" stats --json` | 查看记忆库健康状态（文件数、索引条数、向量库可用性） |
 | `rebuild` | `python "{CLI}" rebuild --json` | 索引与正文不一致时全量重建 |
 
 ### 对于开发者（手动测试）
@@ -364,14 +379,23 @@ entries:
 
 ## 运行测试
 
-```bash
-# 验证模块可导入
-python -c "from add_memory import add_memory; from search_memory import search_memory; print('OK')"
+项目自带 pytest 测试套件，覆盖：YAML 回退解析器（含跨环境读写兼容）、加权检索排序、
+添加/检索/确认/重建全流程、归档机制、路径越界防护、CLI 子进程端到端。
 
-# 端到端测试
+```bash
+pip install pytest
+pytest tests/ -v
+```
+
+GitHub Actions CI 会在 Python 3.9 ~ 3.12 上运行测试，并额外覆盖"无 PyYAML 回退模式"。
+
+手动端到端冒烟测试：
+
+```bash
 python scripts/cli.py add -c habit --content "测试记忆" -p high -t "测试" --emphasis --json
 python scripts/cli.py search "测试" --json
 python scripts/cli.py rebuild --json
+python scripts/cli.py stats --json
 ```
 
 ## 依赖
@@ -380,6 +404,7 @@ python scripts/cli.py rebuild --json
 |------|---------|------|------|
 | Python | >=3.8 | 是 | 运行环境 |
 | PyYAML | >=5.0 | 推荐 | YAML解析，无则启用内置简易解析器 |
+| pytest | >=7.0 | 开发 | 运行测试套件 |
 
 ## 设计文档
 
