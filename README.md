@@ -1,7 +1,7 @@
 # StructuredMemoryManager
 
 > 让 Agent 告别"失忆"和"模糊记忆"的结构化长期记忆管理 Skill。
-> v3.0 加入向量数据库（ChromaDB）语义检索能力；v3.1 修复降级检索与 YAML 回退解析缺陷，新增 `stats` 健康检查、pytest 测试套件与 CI；v3.2 新增自动去重、删除/维护命令、Hooks 自动预加载与原子写入保护。
+> v3.0 加入向量数据库（ChromaDB）语义检索能力；v3.1 修复降级检索与 YAML 回退解析缺陷，新增 `stats` 健康检查、pytest 测试套件与 CI；v3.2 新增自动去重、删除/维护命令、Hooks 自动预加载与原子写入保护；v3.3 新增记忆演化能力（检索热度反馈、时间指数衰减、supersede 冲突失效、标签自动互链）。
 
 ## 简介
 
@@ -24,6 +24,7 @@ StructuredMemoryManager 是一个全面接管 Agent 记忆生成、存储、索�
 - **删除与维护**（v3.2）：`delete` 软删除可恢复（同步向量库），`maintenance` 列出过期/归档候选/长期未更新条目
 - **Hooks 自动预加载**（v3.2）：SessionStart 钩子自动注入高优记忆，不再依赖 Agent 自觉触发
 - **原子写入 + 进程锁**（v3.2）：临时文件 + `os.replace` 原子替换，锁保护索引读改写，多会话并发不再写坏索引
+- **记忆演化**（v3.3）：检索命中自动累计热度并反哺排序，时间权重指数衰减，supersede 冲突失效机制，标签自动互链构建记忆网络
 
 ## 文件结构
 
@@ -196,7 +197,9 @@ python "{CLI}" add \
 | 强制关键字检索 | 需要精确匹配而非语义匹配 | `python "{CLI}" search "..." --no-vector --json` |
 
 **检索结果按加权权重降序排列**，高权重记忆优先纳入上下文。
-向量模式下每条结果包含 `similarity` 字段（0~1，越大越相似）。
+向量模式下每条结果包含 `similarity` 字段（0~1，越大越相似）；
+每条结果可能附带 `related` 字段，列出通过 `related_files` 关联的记忆摘要；
+命中条目的 `access_count` 自动累计，反哺后续排序。
 
 #### 读取单条记忆 — `cli.py read`
 
@@ -217,6 +220,7 @@ python "{CLI}" read "habits/xxx.md" --json
 | `emphasize` | `python "{CLI}" confirm "<path>" "<id>" emphasize --json` | 标记为用户主动强调/重点 |
 | `de_emphasize` | `python "{CLI}" confirm "<path>" "<id>" de_emphasize --json` | 取消强调标记 |
 | `bump_mention` | `python "{CLI}" confirm "<path>" "<id>" bump_mention --json` | 增加提及次数 |
+| `supersede` | `python "{CLI}" confirm "<path>" "<id>" supersede -s "<新记忆路径>" --json` | 标记被新记忆取代：自动降为 low 并退出检索（冲突失效机制） |
 | `stats` | `python "{CLI}" stats --json` | 查看记忆库健康状态（文件数、索引条数、向量库可用性） |
 | `maintenance` | `python "{CLI}" maintenance --json` | 列出过期/归档候选/长期未更新/索引缺失条目 |
 | `delete` | `python "{CLI}" delete "<path>" --json` | 删除记忆（默认软删除可恢复，`--hard` 永久删除） |
@@ -276,21 +280,23 @@ project (30) > habit (20) > skill (10)
 
 | 分类 | 权重排序（高→低） | 设计理由 |
 |------|------------------|---------|
-| **project** | 时间时效性(25) > 用户强调(15) > 常规(0) | 项目任务近期最紧急，时效性优先 |
-| **habit** | 用户强调(25) > 时间时效性(15) > 常规(0) | 用户明确要求的偏好最不可违背 |
+| **project** | 时间时效性(≤25, 衰减) + 用户强调(15) | 项目任务近期最紧急，时效性优先 |
+| **habit** | 用户强调(25) > 时间时效性(≤15, 衰减) | 用户明确要求的偏好最不可违背 |
 | **skill** | 用户强调/反复提及(30) > 常规(0) | 反复提及的技能价值最高 |
 
 ### 权重计算公式
 
 ```
-总分 = 分类基础权重 + 分类内子权重 + 优先级权重 + 关键词匹配分 - 过期惩罚
+总分 = 分类基础权重 + 分类内子权重 + 优先级权重 + 关键词/语义匹配分 + 检索热度加成 - 过期惩罚
 ```
 
 | 权重项 | 值 | 说明 |
 |--------|---|------|
 | 分类基础权重 | project=30, habit=20, skill=10 | 项目最优先 |
+| 分类内 recency 子权重 | 指数衰减，半衰期 30 天 | 当天满分，30 天后减半，90 天后约 12%（v3.3 起连续衰减，替代旧的 30 天二元判断） |
 | 优先级权重 | high=20, medium=10, low=0 | 核心约束永不归档 |
 | 关键词匹配分 | summary匹配+3/词, tag匹配+2/词 | 检索关键词命中加分 |
+| 检索热度加成 | min(10, access_count × 2) | 每次被 search 命中自动 +1，热门记忆排名更靠前（v3.3） |
 | 过期惩罚 | -5 | 已过期的条目减分 |
 
 ### 二级检索流程
@@ -455,6 +461,41 @@ python scripts/cli.py stats --json
 在 ZCode / Claude Code 中配置 SessionStart 钩子后，每次会话开始自动注入
 全部高优先级记忆（关键字模式、零网络依赖、失败静默不影响会话）。
 配置示例见 [integrations/README.md](integrations/README.md)。
+
+## 记忆演化（v3.3 新增）
+
+### 检索热度反馈回路
+
+每次 `search` 命中的条目自动 `access_count` +1 并写回文件与索引
+（`--no-track` 可关闭）。权重公式中的热度加成为
+`min(10, access_count × 2)`——"经常被想起的记忆"排名自然靠前，
+长期无人问津的记忆自然下沉。
+
+### 时间指数衰减
+
+分类内 recency 子权重由"30 天内全额、超期归零"的二元判断改为
+**半衰期 30 天的指数衰减**：当天满分、30 天后减半、90 天后约 12%。
+新旧记忆平滑过渡，一年前的记忆靠分类/优先级/热度依然可被检索到。
+
+### supersede 冲突失效
+
+用户更正偏好时（如"其实我用空格缩进"），Agent 应先 `add` 新记忆，
+再对旧记忆执行 `supersede`：
+
+```bash
+python "{CLI}" confirm "habits/old_tab_001.md" "2026-..." supersede -s "habits/new_space_002.md" --json
+```
+
+旧记忆自动降为 low、标记 `superseded_by`、退出检索结果——
+**新旧记忆不再竞争权重，历史保留可查**（read 仍可访问）。
+这是对 Zep/Graphiti"事实失效而非删除"理念的轻量实现。
+
+### 标签自动互链与关联扩展
+
+`add` 时，新记忆与共享标签数 ≥ 2 的已有记忆自动建立**双向**
+`related_files` 关联（上限 5 条）。`search` 结果附带 `related` 字段，
+列出关联记忆的摘要（每条最多 3 个，`--no-related` 可关闭）——
+检索一条记忆时顺带看到它的"知识邻居"，激活了原本静态的关联字段。
 
 ## 设计文档
 

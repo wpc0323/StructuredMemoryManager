@@ -147,11 +147,15 @@ def _distance_to_similarity(distance) -> float:
 def _build_metadata(entry_id: str, file_path: str, category: str,
                     priority: str, tags: list, emphasis: bool,
                     mention_count: int, date: str,
-                    expires: Optional[str] = None) -> Dict[str, Any]:
+                    expires: Optional[str] = None,
+                    related_files: list = None,
+                    access_count: int = 0) -> Dict[str, Any]:
     """
     构建 ChromaDB metadata。
-    注意: ChromaDB metadata 只支持 str/int/float/bool，不支持 list。
+    注意: ChromaDB metadata 只支持 str/int/float/bool，不支持 list，
+    related_files 以逗号分隔字符串存储。
     """
+    related = related_files if isinstance(related_files, list) else []
     md = {
         "entry_id": entry_id,
         "file_path": file_path,
@@ -161,10 +165,18 @@ def _build_metadata(entry_id: str, file_path: str, category: str,
         "emphasis": bool(emphasis),
         "mention_count": int(mention_count or 0),
         "date": date or "",
+        "access_count": int(access_count or 0),
+        "superseded_by": "",
+        "related_files": ",".join(str(r).replace("\\", "/") for r in related if r),
     }
     if expires is not None:
         md["expires"] = str(expires)
     return md
+
+
+def _split_csv(value: str) -> list:
+    """拆分逗号分隔的 metadata 字符串字段（tags / related_files）"""
+    return [t.strip() for t in str(value or "").split(",") if t.strip()]
 
 
 def _build_document(summary: str, content: str) -> str:
@@ -196,6 +208,8 @@ def add_memory_vector(
     mention_count: int = 0,
     date: str = None,
     expires: Optional[str] = None,
+    related_files: list = None,
+    access_count: int = 0,
     memory_dir: Path = None
 ) -> dict:
     """
@@ -219,7 +233,8 @@ def add_memory_vector(
     metadata = _build_metadata(
         entry_id=entry_id, file_path=file_path, category=category,
         priority=priority, tags=tags or [], emphasis=emphasis,
-        mention_count=mention_count, date=date or "", expires=expires
+        mention_count=mention_count, date=date or "", expires=expires,
+        related_files=related_files, access_count=access_count
     )
 
     try:
@@ -392,6 +407,9 @@ def query_memory_vector(
             "mention_count": int(md.get("mention_count", 0)),
             "date": md.get("date", ""),
             "expires": md.get("expires"),
+            "access_count": int(md.get("access_count", 0) or 0),
+            "superseded_by": md.get("superseded_by", "") or "",
+            "related_files": _split_csv(md.get("related_files", "")),
             "summary": summary,
             "content_snippet": content,
             "similarity": similarity,
@@ -503,6 +521,9 @@ def list_all_vector_memories(
             "mention_count": int(md.get("mention_count", 0)),
             "date": md.get("date", ""),
             "expires": md.get("expires"),
+            "access_count": int(md.get("access_count", 0) or 0),
+            "superseded_by": md.get("superseded_by", "") or "",
+            "related_files": _split_csv(md.get("related_files", "")),
             "summary": summary,
             "content_snippet": content,
             "similarity": 0.0,  # 无查询时无语义相似度，不参与 keyword_score 加分
@@ -586,6 +607,8 @@ def rebuild_vector_store(entries: List[Dict[str, Any]], memory_dir: Path = None)
             mention_count=fm.get("mention_count", entry.get("mention_count", 0)),
             date=fm.get("date", entry.get("last_modified", "")),
             expires=fm.get("expires"),
+            related_files=fm.get("related_files", []),
+            access_count=fm.get("access_count", 0),
         )
 
         document = _build_document(summary, content)

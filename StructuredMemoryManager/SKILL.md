@@ -1,6 +1,6 @@
 ---
 name: StructuredMemoryManager
-version: 3.2.0
+version: 3.3.0
 description: "【每次新对话开始时必须首先调用】预加载用户偏好、习惯、历史决策等高优记忆，确保回复符合用户要求。也用于记录新偏好/习惯、保存任务总结、存储项目决策。"
 license: MIT
 category: memory-management
@@ -90,6 +90,7 @@ Agent 加载时应定位 `cli.py` 的绝对路径，后续所有调用均使用�
 | 强制使用关键字检索 | `python "{CLI}" search "..." --no-vector --json` |
 | 查看某条记忆完整内容 | `python "{CLI}" read "habits/xxx.md" --json` |
 | 确认/更新记忆状态 | `python "{CLI}" confirm "<path>" "<id>" <action> --json` |
+| 冲突记忆失效（用户更正偏好） | `python "{CLI}" confirm "<旧path>" "<旧id>" supersede -s "<新path>" --json` |
 | 索引不一致时修复 | `python "{CLI}" rebuild --json` |
 | 查看记忆库健康状态 | `python "{CLI}" stats --json` |
 | 删除错误/过时记忆 | `python "{CLI}" delete "<path>" --json`（`--hard` 永久删除） |
@@ -98,6 +99,8 @@ Agent 加载时应定位 `cli.py` 的绝对路径，后续所有调用均使用�
 
 > 去重说明：add 默认开启自动去重，与已有记忆重复的内容会合并进原文件
 > （追加正文、提升 mention_count/emphasis/优先级），不新建文件。
+> 冲突说明：用户更正旧偏好时，先 add 新记忆，再对旧记忆执行 supersede，
+> 旧记忆自动降级并退出检索，避免新旧记忆竞争。
 
 ## 加载指令
 

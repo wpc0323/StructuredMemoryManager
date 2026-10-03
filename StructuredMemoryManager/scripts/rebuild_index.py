@@ -83,6 +83,10 @@ def _rebuild_index_impl(mem_dir: Path = None) -> dict:
             if category == "project" and fm.get("project_name"):
                 entry_data["title"] = fm["project_name"]
 
+            # 被取代的旧条目在索引中保留标记（检索时排除，历史可查）
+            if fm.get("superseded_by"):
+                entry_data["superseded_by"] = fm["superseded_by"]
+
             entries.append(entry_data)
 
     # 按修改时间倒序排列

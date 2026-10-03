@@ -23,6 +23,9 @@
 | `last_modified` | string (ISO 8601) | 是 | - | 最后修改时间，含时区 |
 | `emphasis` | boolean | 是 | false | 用户主动强调/标记重点 |
 | `mention_count` | integer | 否 | 0 | 提及次数（skill 类别，>=3视为反复提及） |
+| `access_count` | integer | 否 | 0 | 被检索命中的累计次数（search 自动 +1，热度反馈回路） |
+| `last_accessed` | string \| null | 否 | null | 最后一次被检索命中的时间 |
+| `superseded_by` | string \| null | 否 | null | 取代本条目的新记忆路径；非空时检索不再命中（冲突失效机制） |
 
 ### project 类别额外字段
 
@@ -53,10 +56,13 @@ priority: high
 tags: [交互风格, emoji]
 summary: "用户明确要求永远不要使用emoji"
 expires: null
-related_files: []
+related_files: ["habits/no_slang_002.md"]
 last_modified: "2026-07-19T12:00:00+08:00"
 emphasis: true
 mention_count: 0
+access_count: 3
+last_accessed: "2026-08-01T09:30:00+08:00"
+superseded_by: null
 ---
 
 正文内容（Markdown格式）...
@@ -118,6 +124,9 @@ entries:
 | `last_modified` | string (ISO 8601) | 是 | 最后修改时间 |
 | `emphasis` | boolean | 是 | 是否用户强调 |
 | `mention_count` | integer | 否 | 提及次数（skill 类别） |
+| `access_count` | integer | 否 | 被检索命中的累计次数 |
+| `last_accessed` | string \| null | 否 | 最后一次被检索命中的时间 |
+| `superseded_by` | string \| null | 否 | 取代本条目的新记忆路径（非空时检索排除） |
 | `title` | string | 否 | 项目标题（project 类别） |
 
 ### 完整示例
@@ -159,9 +168,15 @@ entries:
 
 ---
 
-## 五、归档文件
+## 五、归档与删除文件
 
-归档文件与原文件格式完全相同，只是存放在 `archive/` 子目录下。归档后 `memory_index.md` 中对应条目的 `path` 更新为归档路径。
+**归档文件**（`archive/` 子目录）与原文件格式完全相同，只是存放在类别目录的
+`archive/` 下。归档后 `memory_index.md` 中对应条目的 `path` 更新为归档路径，
+检索仍可命中。
+
+**软删除文件**（`deleted/` 子目录）同样保持原格式，但索引条目与向量库记录
+已被移除，检索不再命中；文件可手动移回恢复。`rebuild` 不会把 deleted/ 中的
+文件重新索引。
 
 ---
 

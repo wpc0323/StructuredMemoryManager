@@ -18,20 +18,24 @@ from pathlib import Path
 # 支持独立运行和包导入
 try:
     from ._base import (
-        read_memory_index, read_memory_file, is_expired,
+        read_memory_index, read_memory_file, write_memory_file,
+        write_memory_index, now_iso, is_expired,
         MEMORY_DIR, CATEGORY_DIR_MAP,
         compute_weight, resolve_conflict, is_vector_available,
-        resolve_within_memory_dir,
+        resolve_within_memory_dir, memory_lock, same_relpath,
+        RELATED_EXPANSION_LIMIT,
     )
-    from .vector_store import query_memory_vector, list_all_vector_memories
+    from .vector_store import query_memory_vector, list_all_vector_memories, update_memory_metadata
 except ImportError:
     from _base import (
-        read_memory_index, read_memory_file, is_expired,
+        read_memory_index, read_memory_file, write_memory_file,
+        write_memory_index, now_iso, is_expired,
         MEMORY_DIR, CATEGORY_DIR_MAP,
         compute_weight, resolve_conflict, is_vector_available,
-        resolve_within_memory_dir,
+        resolve_within_memory_dir, memory_lock, same_relpath,
+        RELATED_EXPANSION_LIMIT,
     )
-    from vector_store import query_memory_vector, list_all_vector_memories
+    from vector_store import query_memory_vector, list_all_vector_memories, update_memory_metadata
 
 
 def read_memory(
@@ -82,6 +86,8 @@ def search_memory(
     high_priority_only: bool = False,
     memory_dir: Path = None,
     use_vector: bool = True,
+    track_access: bool = True,
+    expand_related: bool = True,
 ) -> list:
     """
     执行加权二级检索：总目录粗筛 → 独立文件精读
@@ -94,9 +100,14 @@ def search_memory(
          - 现有逻辑：总目录关键字匹配 → 独立文件精读
 
     检索排序遵循加权检索规范：
-      分类1(project): 时间时效性(近期优先) > 用户强调/标记重点 > 常规记录
-      分类2(habit): 用户强调/明确要求 > 时间时效性(最新优先) > 次要偏好
+      分类1(project): 时间时效性(指数衰减) > 用户强调/标记重点 > 常规记录
+      分类2(habit): 用户强调/明确要求 > 时间时效性(指数衰减) > 次要偏好
       分类3(skill): 用户强调/反复提及(mention_count>=3) > 其余全部
+
+    后处理（v3.3）:
+      - track_access: 命中条目 access_count +1 并写回（热度反馈回路）
+      - expand_related: 按 related_files 附加关联记忆摘要
+      - 已被取代（superseded_by 非空）的条目不参与检索
 
     参数:
         query: 检索查询词或自然语言问题
@@ -105,14 +116,15 @@ def search_memory(
         high_priority_only: 是否仅返回高优先级条目
         memory_dir: 自定义记忆目录
         use_vector: 是否启用向量检索（True 优先，False 强制关键字）
+        track_access: 是否回写命中计数（热度反馈回路）
+        expand_related: 是否展开关联记忆
 
     返回:
         [{"file_path", "entry_id", "summary", "content_snippet",
           "score", "weight", "priority", "tags", "emphasis", "mention_count",
-          "similarity"(向量模式)}]
+          "related"(expand_related 时), "similarity"(向量模式)}]
     """
     tag_filter = tag_filter or []
-    results = []
     mem_dir = memory_dir or MEMORY_DIR
 
     # 判断是否启用向量检索
@@ -120,18 +132,26 @@ def search_memory(
 
     # ============ 向量检索模式 ============
     if vector_enabled:
-        vector_results = _search_via_vector(
+        results = _search_via_vector(
             query=query,
             category_filter=category_filter,
             tag_filter=tag_filter,
             high_priority_only=high_priority_only,
             memory_dir=mem_dir,
         )
-        if vector_results:
-            return vector_results
-        # 向量库为空或查询失败（如索引未同步、嵌入模型缺失）时，
-        # 自动降级到关键字检索，避免"chromadb 已装但检索恒为空"。
-        return _search_via_keyword(
+        if not results:
+            # 向量库为空或查询失败（如索引未同步、嵌入模型缺失）时，
+            # 自动降级到关键字检索，避免"chromadb 已装但检索恒为空"。
+            results = _search_via_keyword(
+                query=query,
+                category_filter=category_filter,
+                tag_filter=tag_filter,
+                high_priority_only=high_priority_only,
+                memory_dir=mem_dir,
+            )
+    else:
+        # ============ 关键字检索模式（降级） ============
+        results = _search_via_keyword(
             query=query,
             category_filter=category_filter,
             tag_filter=tag_filter,
@@ -139,14 +159,98 @@ def search_memory(
             memory_dir=mem_dir,
         )
 
-    # ============ 关键字检索模式（降级） ============
-    return _search_via_keyword(
-        query=query,
-        category_filter=category_filter,
-        tag_filter=tag_filter,
-        high_priority_only=high_priority_only,
-        memory_dir=mem_dir,
-    )
+    # 后处理：热度反馈回路 + 关联扩展（任何失败不影响检索结果本身）
+    if results and track_access:
+        _track_access(results, mem_dir)
+    if results and expand_related:
+        results = _expand_related(results, mem_dir)
+    return results
+
+
+def _track_access(results: list, mem_dir: Path):
+    """
+    检索命中回写（热度反馈回路）：
+    结果条目的 access_count +1、last_accessed 更新，同步总目录索引与向量库元数据。
+    权重公式用 access_count 计算检索热度加成——"被频繁命中的记忆"获得更高权重。
+    尽力而为：任何失败都静默吞掉，不影响检索结果。
+    """
+    try:
+        now = now_iso()
+        vector_updates = []  # (entry_id, access_count)
+        with memory_lock(mem_dir):
+            index_fm = read_memory_index(memory_dir=mem_dir)
+            index_changed = False
+            for r in results:
+                rel = r.get("file_path", "")
+                if not rel:
+                    continue
+                abs_path = resolve_within_memory_dir(rel, mem_dir)
+                if abs_path is None or not abs_path.exists():
+                    continue
+                fm, body = read_memory_file(abs_path)
+                if not fm:
+                    continue
+                fm["access_count"] = int(fm.get("access_count", 0) or 0) + 1
+                fm["last_accessed"] = now
+                write_memory_file(abs_path, fm, body)
+                if r.get("entry_id"):
+                    vector_updates.append((r["entry_id"], fm["access_count"]))
+                for entry in index_fm.get("entries", []):
+                    # project 文件可能对应多条索引行，全部同步
+                    if isinstance(entry, dict) and same_relpath(entry.get("path", ""), rel):
+                        entry["access_count"] = fm["access_count"]
+                        entry["last_accessed"] = now
+                        index_changed = True
+            if index_changed:
+                index_fm["last_modified"] = now
+                write_memory_index(index_fm, memory_dir=mem_dir)
+        if is_vector_available():
+            for entry_id, count in vector_updates:
+                update_memory_metadata(
+                    entry_id=entry_id,
+                    metadata_updates={"access_count": count, "last_accessed": now},
+                    memory_dir=mem_dir,
+                )
+    except Exception:
+        pass
+
+
+def _expand_related(results: list, mem_dir: Path) -> list:
+    """
+    关联扩展：按条目的 related_files 附加关联记忆的摘要。
+    已出现在主结果中的路径不重复展开；每条最多展开 RELATED_EXPANSION_LIMIT 条。
+    """
+    try:
+        index_fm = read_memory_index(memory_dir=mem_dir)
+        by_path = {}
+        for e in index_fm.get("entries", []):
+            if isinstance(e, dict) and e.get("path"):
+                by_path[str(e["path"]).replace("\\", "/")] = e
+        seen = {str(r.get("file_path", "")).replace("\\", "/") for r in results}
+        for r in results:
+            related_raw = r.pop("related_files", None) or []
+            related = []
+            for rel in related_raw:
+                if len(related) >= RELATED_EXPANSION_LIMIT:
+                    break
+                rel_norm = str(rel).replace("\\", "/")
+                if rel_norm in seen:
+                    continue
+                entry = by_path.get(rel_norm)
+                if not entry:
+                    continue
+                related.append({
+                    "file_path": rel_norm,
+                    "summary": entry.get("summary", ""),
+                    "category": entry.get("category", ""),
+                    "priority": entry.get("priority", ""),
+                })
+                seen.add(rel_norm)
+            if related:
+                r["related"] = related
+    except Exception:
+        pass
+    return results
 
 
 def _build_where_filter(category_filter: str = None, high_priority_only: bool = False) -> dict:
@@ -165,12 +269,13 @@ def _build_where_filter(category_filter: str = None, high_priority_only: bool = 
 
 
 def _apply_post_filters(entries: list, tag_filter: list, high_priority_only: bool) -> list:
-    """对向量库返回的结果应用 tag_filter（ChromaDB 不直接支持 list 标签过滤）"""
-    if not tag_filter and not high_priority_only:
-        return entries
-
+    """对向量库返回的结果应用 tag_filter（ChromaDB 不直接支持 list 标签过滤），
+    并过滤已被新记忆取代（superseded_by 非空）的条目"""
     filtered = []
     for e in entries:
+        # 已被取代的条目不参与检索
+        if e.get("superseded_by"):
+            continue
         # tag 过滤（任一匹配）
         if tag_filter:
             entry_tags = e.get("tags", [])
@@ -210,7 +315,7 @@ def _search_via_vector(
             memory_dir=memory_dir,
         )
 
-    # 应用 tag_filter（向量库不直接支持）
+    # 应用 tag_filter（向量库不直接支持）与 superseded 过滤
     candidates = _apply_post_filters(candidates, tag_filter, high_priority_only)
 
     # 用 compute_weight 综合排序
@@ -229,6 +334,7 @@ def _search_via_vector(
             date_str=c.get("date"),
             keyword_score=semantic_score,
             expires_str=c.get("expires"),
+            access_count=c.get("access_count", 0),
         )
 
         results.append({
@@ -244,6 +350,7 @@ def _search_via_vector(
             "emphasis": c.get("emphasis", False),
             "mention_count": c.get("mention_count", 0),
             "date": c.get("date"),
+            "related_files": c.get("related_files", []),
             "similarity": round(similarity, 4),
         })
 
@@ -273,6 +380,10 @@ def _search_via_keyword(
 
         # 类别过滤
         if category_filter and entry_info.get("category") != category_filter:
+            continue
+
+        # 已被新记忆取代（supersede）的旧条目不参与检索
+        if entry_info.get("superseded_by"):
             continue
 
         keyword_score = 0
@@ -318,6 +429,7 @@ def _search_via_keyword(
             date_str=date_str,
             keyword_score=keyword_score,
             expires_str=expires_str,
+            access_count=entry_info.get("access_count", 0),
         )
 
         candidate_entries.append((entry_info, keyword_score, weight))
@@ -354,6 +466,8 @@ def _search_via_keyword(
             date_str=fm_date,
             keyword_score=keyword_score,
             expires_str=fm_expires,
+            access_count=fm.get("access_count", 0),
+            superseded=bool(fm.get("superseded_by")),
         )
 
         # 提取内容片段
@@ -374,6 +488,7 @@ def _search_via_keyword(
             "emphasis": fm_emphasis,
             "mention_count": fm_mention_count,
             "date": entry_info.get("last_modified") or fm.get("date"),
+            "related_files": fm.get("related_files") or [],
         })
 
     # 按综合权重排序返回（高权重优先）

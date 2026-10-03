@@ -83,6 +83,8 @@ def cmd_search(args) -> list:
         tag_filter=_parse_tags(args.tags),
         high_priority_only=args.high_priority,
         use_vector=not args.no_vector,
+        track_access=not args.no_track,
+        expand_related=not args.no_related,
     )
 
 
@@ -100,6 +102,7 @@ def cmd_confirm(args) -> dict:
         new_expires=args.expires,
         new_priority=args.priority,
         mention_count=args.mention_count,
+        superseded_by=args.superseded_by,
     )
 
 
@@ -180,6 +183,10 @@ def main():
                           help="仅返回高优先级条目")
     p_search.add_argument("--no-vector", action="store_true",
                           help="禁用向量检索，强制使用关键字匹配模式")
+    p_search.add_argument("--no-track", action="store_true",
+                          help="不回写命中计数（只读检索，热度不加一）")
+    p_search.add_argument("--no-related", action="store_true",
+                          help="不展开关联记忆（related 字段）")
     _add_json_flag(p_search)
 
     # ── read ─────────────────────────────────────────
@@ -196,7 +203,8 @@ def main():
                            help="条目 ID (格式: YYYY-MM-DD-HH-MM-NNN)")
     p_confirm.add_argument("action",
                            choices=["confirm", "extend", "upgrade", "downgrade",
-                                    "emphasize", "de_emphasize", "bump_mention"],
+                                    "emphasize", "de_emphasize", "bump_mention",
+                                    "supersede"],
                            help="操作类型")
     p_confirm.add_argument("-e", "--expires", default=None,
                            help="新过期日期 (extend 时必填)")
@@ -204,6 +212,8 @@ def main():
                            help="新优先级 (upgrade/downgrade 时可选)")
     p_confirm.add_argument("-m", "--mention-count", type=int, default=None,
                            help="提及次数 (bump_mention 时可选，默认当前值+1)")
+    p_confirm.add_argument("-s", "--superseded-by", default=None,
+                           help="取代本条目的新记忆路径 (supersede 时必填)")
     _add_json_flag(p_confirm)
 
     # ── rebuild ──────────────────────────────────────
@@ -262,6 +272,8 @@ def main():
                     print(f"[{i}] ({r.get('priority','?')}) {r.get('summary','')}{emp}{mc}")
                     print(f"    文件: {r.get('file_path','')} | ID: {r.get('entry_id','')} "
                           f"| 权重: {r.get('weight',0):.0f} | 匹配分: {r.get('score',0)}\n")
+                    for rel in r.get("related", []) or []:
+                        print(f"    关联: {rel.get('file_path','')} | {rel.get('summary','')}")
         else:
             if args.command == "delete" and isinstance(result, dict):
                 print(result.get("message") or result.get("error", ""))

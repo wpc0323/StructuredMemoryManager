@@ -37,6 +37,7 @@ def confirm_memory(
     new_expires: str = None,
     new_priority: str = None,
     mention_count: int = None,
+    superseded_by: str = None,
     memory_dir: Path = None
 ) -> dict:
     """确认或更新记忆状态（带跨进程锁）。参数详见 _confirm_memory_impl。"""
@@ -45,7 +46,8 @@ def confirm_memory(
         return _confirm_memory_impl(
             file_path=file_path, entry_id=entry_id, action=action,
             new_expires=new_expires, new_priority=new_priority,
-            mention_count=mention_count, mem_dir=mem_dir,
+            mention_count=mention_count, superseded_by=superseded_by,
+            mem_dir=mem_dir,
         )
 
 
@@ -56,6 +58,7 @@ def _confirm_memory_impl(
     new_expires: str = None,
     new_priority: str = None,
     mention_count: int = None,
+    superseded_by: str = None,
     mem_dir: Path = None
 ) -> dict:
     """
@@ -73,9 +76,11 @@ def _confirm_memory_impl(
             - emphasize: 标记为用户主动强调/重点
             - de_emphasize: 取消强调标记
             - bump_mention: 增加提及次数
+            - supersede: 标记被新记忆取代（需提供superseded_by），自动降为low并退出检索
         new_expires: 新过期日期 (extend时必填)
         new_priority: 新优先级 (upgrade时默认"high"，downgrade时默认"low")
         mention_count: 提及次数 (bump_mention时使用，默认当前值+1)
+        superseded_by: 取代本条目的新记忆路径 (supersede时必填)
         mem_dir: 已解析的记忆目录（由外层 confirm_memory 传入）
 
     返回:
@@ -133,8 +138,19 @@ def _confirm_memory_impl(
             fm["mention_count"] = current + 1
         message = f"条目 {entry_id} 提及次数已更新为 {fm['mention_count']}"
 
+    elif action == "supersede":
+        # 冲突失效机制：用户更正偏好时，旧记忆标记被取代并降级，
+        # 检索不再命中（历史保留，可通过 read 查看），避免新旧记忆竞争权重
+        if not superseded_by:
+            return {"success": False,
+                    "error": "supersede 操作需要提供取代它的记忆路径（--superseded-by）"}
+        fm["superseded_by"] = superseded_by
+        fm["priority"] = "low"
+        message = (f"条目 {entry_id} 已被 {superseded_by} 取代，"
+                   f"自动降为 low 并在检索中排除")
+
     else:
-        return {"success": False, "error": f"未知操作: {action}，有效值为 confirm/extend/upgrade/downgrade/emphasize/de_emphasize/bump_mention"}
+        return {"success": False, "error": f"未知操作: {action}，有效值为 confirm/extend/upgrade/downgrade/emphasize/de_emphasize/bump_mention/supersede"}
 
     # 更新修改时间
     fm["last_modified"] = now
@@ -157,6 +173,8 @@ def _confirm_memory_impl(
                 entry["expires"] = None
             elif action == "extend" and new_expires:
                 entry["expires"] = new_expires
+            if action == "supersede" and fm.get("superseded_by"):
+                entry["superseded_by"] = fm["superseded_by"]
             break
     write_memory_index(index_fm, memory_dir=mem_dir)
 
@@ -173,6 +191,9 @@ def _confirm_memory_impl(
             metadata_updates["emphasis"] = False
         elif action == "bump_mention":
             metadata_updates["mention_count"] = fm.get("mention_count", 0)
+        elif action == "supersede":
+            metadata_updates["superseded_by"] = fm.get("superseded_by", "")
+            metadata_updates["priority"] = fm.get("priority")
         elif action == "confirm":
             metadata_updates["expires"] = ""
         elif action == "extend" and new_expires:
@@ -206,11 +227,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="StructuredMemoryManager - 确认/更新记忆")
     parser.add_argument("file_path", help="目标文件路径（相对memory目录）")
     parser.add_argument("entry_id", help="条目ID")
-    parser.add_argument("action", choices=["confirm", "extend", "upgrade", "downgrade", "emphasize", "de_emphasize", "bump_mention"],
+    parser.add_argument("action", choices=["confirm", "extend", "upgrade", "downgrade", "emphasize", "de_emphasize", "bump_mention", "supersede"],
                         help="操作类型")
     parser.add_argument("--expires", "-e", default=None, help="新过期日期 (extend时必填)")
     parser.add_argument("--priority", "-p", default=None, help="新优先级 (upgrade/downgrade)")
     parser.add_argument("--mention-count", "-m", type=int, default=None, help="提及次数 (bump_mention时使用)")
+    parser.add_argument("--superseded-by", "-s", default=None, help="取代本条目的新记忆路径 (supersede时必填)")
     parser.add_argument("--json", action="store_true", help="JSON格式输出")
 
     args = parser.parse_args()
@@ -221,7 +243,8 @@ if __name__ == "__main__":
         action=args.action,
         new_expires=args.expires,
         new_priority=args.priority,
-        mention_count=args.mention_count
+        mention_count=args.mention_count,
+        superseded_by=args.superseded_by
     )
 
     print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else result)

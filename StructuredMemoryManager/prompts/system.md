@@ -71,7 +71,7 @@ python "{CLI}" add -c project --content "选择PostgreSQL作为主数据库" -p 
 ### 2. 检索记忆 — `search`
 
 ```bash
-python "{CLI}" search "<查询词>" [--category <habit|skill|project>] [-t "<标签1,标签2>"] [--high-priority] --json
+python "{CLI}" search "<查询词>" [--category <habit|skill|project>] [-t "<标签1,标签2>"] [--high-priority] [--no-track] [--no-related] --json
 ```
 
 **参数说明：**
@@ -82,6 +82,12 @@ python "{CLI}" search "<查询词>" [--category <habit|skill|project>] [-t "<标
 | `--category` | | 否 | null | 类别过滤：habit / skill / project |
 | `--tags` | `-t` | 否 | "" | 标签过滤，逗号分隔 |
 | `--high-priority` | | 否 | false | 仅返回高优先级条目 |
+| `--no-track` | | 否 | false | 不回写命中计数（只读检索） |
+| `--no-related` | | 否 | false | 不展开关联记忆（结果中的 related 字段） |
+
+> 检索默认行为：命中条目的 `access_count` 自动 +1（热度反馈回路，影响后续排序）；
+> 结果附带 `related` 字段列出通过 related_files 关联的记忆摘要；
+> 已被取代（superseded_by）的条目自动排除。
 
 **典型调用示例：**
 
@@ -125,7 +131,7 @@ python "{CLI}" read "projects/data_platform.md" --json
 ### 4. 确认/更新记忆 — `confirm`
 
 ```bash
-python "{CLI}" confirm "<文件路径>" "<entry_id>" <confirm|extend|upgrade|downgrade|emphasize|de_emphasize|bump_mention> [-e "<新日期>"] [-p "<新优先级>"] [-m <提及次数>] --json
+python "{CLI}" confirm "<文件路径>" "<entry_id>" <confirm|extend|upgrade|downgrade|emphasize|de_emphasize|bump_mention|supersede> [-e "<新日期>"] [-p "<新优先级>"] [-m <提及次数>] [-s "<取代它的记忆路径>"] --json
 ```
 
 **参数说明：**
@@ -138,6 +144,7 @@ python "{CLI}" confirm "<文件路径>" "<entry_id>" <confirm|extend|upgrade|dow
 | `--expires` | `-e` | 否 | null | 新过期日期（extend 时必填） |
 | `--priority` | `-p` | 否 | null | 新优先级（upgrade 默认 high，downgrade 默认 low） |
 | `--mention-count` | `-m` | 否 | null | 提及次数（bump_mention 时可选，默认当前值+1） |
+| `--superseded-by` | `-s` | 否 | null | 取代本条目的新记忆路径（supersede 时必填） |
 
 **action 说明：**
 
@@ -150,6 +157,7 @@ python "{CLI}" confirm "<文件路径>" "<entry_id>" <confirm|extend|upgrade|dow
 | `emphasize` | 标记为用户主动强调/重点 | 用户再次强调某偏好 |
 | `de_emphasize` | 取消强调标记 | 偏好已弱化 |
 | `bump_mention` | 增加提及次数 | 同一技能再次被使用/提及 |
+| `supersede` | 标记被新记忆取代（需 `-s` 指定新记忆路径），自动降为 low 并退出检索 | 用户更正了旧偏好（如"其实我用空格缩进"），先 add 新记忆再 supersede 旧的 |
 
 **典型调用示例：**
 
@@ -374,6 +382,7 @@ emphasis: true
    - 同步更新 `memory_index.md` 的 `entries` 列表，插入新条目记录
    - **归档检查**：若该类别目录下文件数超过50，触发归档流程（见第六节）
    - **自动去重**：新内容与已有 habit/skill 记忆重复时（归一化后精确匹配，或向量相似度 ≥ 0.95）不新建文件，合并进原文件（无损追加正文，提升 mention_count/emphasis/优先级）；确需另存新条目时加 `--no-dedup` 参数
+   - **标签自动互链**：新记忆与共享标签数 ≥ 2 的已有记忆自动建立双向 related_files 关联（上限 5 条），构建记忆间的链接网络
 3. **同步保证**：写入完成后，总目录索引与文件系统必须严格一致。若出现不一致，执行 `rebuild` 修复。
 
 ### 3.1 emphasis（强调标记）使用场景
@@ -422,25 +431,32 @@ emphasis: true
 ### 4.3 权重计算公式
 
 ```
-总分 = 分类基础权重 + 分类内子权重 + 优先级权重 + 关键词匹配分 - 过期惩罚
+总分 = 分类基础权重 + 分类内子权重 + 优先级权重 + 关键词/语义匹配分 + 检索热度加成 - 过期惩罚
 
 分类基础权重：
   project = 30（最高，项目任务最优先）
   habit   = 20（其次，用户偏好很重要）
   skill   = 10（最后，技能作为辅助参考）
 
-分类内子权重（差异化排序，体现各类别的优先级差异）：
-  project: 时间时效性(25) > 用户强调(15) > 常规(0)
-  habit:   用户强调(25) > 时间时效性(15) > 常规(0)
-  skill:   用户强调/反复提及(30) > 常规(0)
+分类内子权重（recency 按指数衰减连续计分，半衰期 30 天：
+  当天=满分，30 天后减半，90 天后约 12%，一年后趋近 0）：
+  project: 时间时效性(≤25, 衰减) + 用户强调(15)
+  habit:   用户强调(25) > 时间时效性(≤15, 衰减)
+  skill:   用户强调/反复提及(30)
 
 优先级权重：
   high   = 20
   medium = 10
   low    = 0
 
+检索热度加成 = min(10, access_count × 2)
+  （条目每次被 search 命中 access_count 自动 +1，频繁命中的记忆权重更高）
+
 过期惩罚 = 5（已过期的条目减分）
 ```
+
+**注意**：已被新记忆取代（superseded_by 非空）的条目不参与检索结果，
+检索排序时无需考虑。
 
 ### 4.4 第一级：总目录粗筛
 
@@ -574,6 +590,7 @@ related_files:
 | 标记强调 | `emphasize` | 标记为用户主动强调/重点 | 无 |
 | 取消强调 | `de_emphasize` | 取消强调标记 | 无 |
 | 增加提及 | `bump_mention` | 更新提及次数 | `-m`（可选，默认+1） |
+| 标记被取代 | `supersede` | 冲突失效：旧记忆标记 superseded_by、降为 low、退出检索 | `-s`（必填，新记忆路径） |
 
 每次操作后自动同步更新总目录 `memory_index.md` 中的对应条目。
 
@@ -590,6 +607,7 @@ related_files:
 | 加权排序 | 检索结果必须按加权权重排序，高权重优先纳入上下文 |
 | 强调标记 | emphasis=true 的记忆必须优先于同分类其他记忆 |
 | 冲突解决 | 记忆冲突时直接采信权重更高的信息 |
+| 冲突失效 | 用户更正偏好时，先 add 新记忆，再对旧记忆执行 supersede，让新旧记忆不再竞争 |
 | 索引同步 | 写入后必须保证总目录索引与文件系统严格一致 |
 | 高优优先 | 启动时优先执行 search --high-priority 加载 |
 | 及时遗忘 | 用户否认或明显过时的记忆应及时 delete 移除，不长期占用检索权重 |

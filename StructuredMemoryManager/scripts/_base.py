@@ -55,6 +55,16 @@ DEDUP_SIMILARITY = 0.95      # 向量去重阈值：新记忆与已有记忆相�
 LOCK_TIMEOUT_SECONDS = 10.0  # 进程锁等待超时
 LOCK_STALE_SECONDS = 30.0    # 锁文件超过该时长视为残留锁，自动清理
 
+# 检索热度与时间衰减（v3.3）
+RECENCY_HALF_LIFE_DAYS = 30  # recency 子权重指数衰减的半衰期（天）
+ACCESS_BONUS_MAX = 10        # 检索热度加成上限
+ACCESS_BONUS_STEP = 2        # 每被检索命中一次增加的热度分
+
+# 自动互链（v3.3）
+AUTO_LINK_MIN_SHARED_TAGS = 2  # 标签重叠达到该数量时自动建立 related_files 关联
+AUTO_LINK_MAX_LINKS = 5        # 单条新记忆最多自动建立的关联数
+RELATED_EXPANSION_LIMIT = 3    # 检索结果中每条最多展开的关联记忆数
+
 # 类别对应的子目录名
 CATEGORY_DIR_MAP = {
     "habit": "habits",
@@ -115,6 +125,20 @@ PRIORITY_WEIGHT_MAP = {
 # 权重总分 = 分类基础权重 + 分类内子权重 + 优先级权重 + 关键词匹配分
 
 
+def recency_factor(date_str: str = None) -> float:
+    """
+    时间衰减因子（0~1）：半衰期 30 天的指数衰减。
+    当天 = 1.0，30 天前 = 0.5，90 天前 = 0.125，一年后趋近 0。
+    替代旧版"30 天内视为近期"的二元判断，使新旧记忆平滑过渡。
+    """
+    if not date_str:
+        return 0.0
+    days = days_since(date_str)
+    if days < 0:
+        days = 0
+    return 0.5 ** (days / float(RECENCY_HALF_LIFE_DAYS))
+
+
 def compute_weight(
     category: str,
     priority: str,
@@ -123,12 +147,21 @@ def compute_weight(
     date_str: str = None,
     keyword_score: float = 0,
     expires_str: str = None,
+    access_count: int = 0,
+    superseded: bool = False,
 ) -> float:
     """
     计算单条记忆的综合权重分数。
 
-    权重公式：
-        总分 = 分类基础权重 + 分类内子权重 + 优先级权重 + 关键词匹配分 - 过期惩罚
+    权重公式（v3.3）：
+        总分 = 分类基础权重 + 分类内子权重 + 优先级权重
+               + 关键词/语义匹配分 + 检索热度加成 - 过期惩罚
+
+    相比旧版的变化：
+      - recency 子权重由"30 天内全额、超期归零"改为按半衰期 30 天指数衰减连续计分
+      - 新增检索热度加成：条目每次被 search 命中 access_count +1，
+        加成 = min(ACCESS_BONUS_MAX, access_count * ACCESS_BONUS_STEP)
+      - superseded=True（已被新记忆取代）直接返回极低分（检索层会先过滤，此处兜底）
 
     参数:
         category: 记忆分类 (habit/skill/project)
@@ -138,50 +171,48 @@ def compute_weight(
         date_str: 条目日期(ISO)，用于计算时效性
         keyword_score: 关键词匹配得分
         expires_str: 过期日期，用于过期惩罚
+        access_count: 被检索命中的累计次数
+        superseded: 是否已被更新的记忆取代
     """
     # 1. 分类基础权重
     base = CATEGORY_WEIGHT.get(category, 0)
 
     # 2. 分类内子权重
     sub = 0
-    is_recent = False
-    if date_str:
-        days = days_since(date_str)
-        is_recent = days <= 30  # 30天内视为近期
+    recency = recency_factor(date_str)
 
     if category == "project":
-        if is_recent:
-            sub += PROJECT_SUB_WEIGHTS["recency"]
+        sub += PROJECT_SUB_WEIGHTS["recency"] * recency
         if emphasis:
             sub += PROJECT_SUB_WEIGHTS["emphasis"]
-        else:
-            sub += PROJECT_SUB_WEIGHTS["normal"]
 
     elif category == "habit":
         if emphasis:
             sub += HABIT_SUB_WEIGHTS["emphasis"]
-        elif is_recent:
-            sub += HABIT_SUB_WEIGHTS["recency"]
         else:
-            sub += HABIT_SUB_WEIGHTS["normal"]
+            sub += HABIT_SUB_WEIGHTS["recency"] * recency
 
     elif category == "skill":
         # 反复提及：mention_count >= 3 视为 emphasis
         if emphasis or mention_count >= 3:
             sub += SKILL_SUB_WEIGHTS["emphasis"]
-        else:
-            sub += SKILL_SUB_WEIGHTS["normal"]
 
     # 3. 优先级权重
     prio = PRIORITY_WEIGHT_MAP.get(priority, 0)
 
-    # 4. 过期惩罚
+    # 4. 检索热度加成
+    access_bonus = min(ACCESS_BONUS_MAX, int(access_count or 0) * ACCESS_BONUS_STEP)
+
+    # 5. 过期惩罚
     expire_penalty = 0
     if expires_str and is_expired(expires_str):
         expire_penalty = 5
 
+    if superseded:
+        return -100.0
+
     # 总分
-    total = base + sub + prio + keyword_score - expire_penalty
+    total = base + sub + prio + keyword_score + access_bonus - expire_penalty
     return total
 
 

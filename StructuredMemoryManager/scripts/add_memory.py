@@ -22,7 +22,7 @@ try:
         ARCHIVE_THRESHOLD, ARCHIVE_AGE_DAYS, ARCHIVE_AGE_DAYS_FALLBACK,
         CATEGORY_DIR_MAP, days_since, is_vector_available,
         memory_lock, relpath_posix, same_relpath, normalize_text_key,
-        DEDUP_SIMILARITY
+        DEDUP_SIMILARITY, AUTO_LINK_MIN_SHARED_TAGS, AUTO_LINK_MAX_LINKS
     )
     from .vector_store import add_memory_vector, find_similar_memories
 except ImportError:
@@ -33,7 +33,7 @@ except ImportError:
         ARCHIVE_THRESHOLD, ARCHIVE_AGE_DAYS, ARCHIVE_AGE_DAYS_FALLBACK,
         CATEGORY_DIR_MAP, days_since, is_vector_available,
         memory_lock, relpath_posix, same_relpath, normalize_text_key,
-        DEDUP_SIMILARITY
+        DEDUP_SIMILARITY, AUTO_LINK_MIN_SHARED_TAGS, AUTO_LINK_MAX_LINKS
     )
     from vector_store import add_memory_vector, find_similar_memories
 
@@ -235,8 +235,57 @@ def _scan_existing_entries(mem_dir: Path) -> list:
                 "summary_norm": normalize_text_key(fm.get("summary", "")),
                 "body": body,
                 "body_norm": normalize_text_key(body),
+                "tags": fm.get("tags") or [],
             })
     return entries
+
+
+def _append_related(file_abs: Path, new_related: list):
+    """向记忆文件的 related_files 追加路径（去重、POSIX 化），无变化时不重写文件"""
+    fm, body = read_memory_file(file_abs)
+    if not fm:
+        return
+    related = fm.get("related_files") or []
+    if isinstance(related, str):
+        related = [r.strip() for r in related.split(",") if r.strip()]
+    related_norm = [str(r).replace("\\", "/") for r in related]
+    changed = False
+    for r in new_related:
+        r_norm = str(r).replace("\\", "/")
+        if r_norm not in related_norm:
+            related_norm.append(r_norm)
+            changed = True
+    if changed:
+        fm["related_files"] = related_norm
+        write_memory_file(file_abs, fm, body)
+
+
+def _auto_link_related(new_file_rel: str, tags: list,
+                       existing_entries: list, mem_dir: Path) -> list:
+    """
+    标签自动互链：新记忆与共享标签数 >= AUTO_LINK_MIN_SHARED_TAGS 的已有记忆
+    建立双向 related_files 关联（上限 AUTO_LINK_MAX_LINKS 条），
+    构建记忆间的链接网络（A-MEM 式卡片盒的轻量实现）。
+    返回与新记忆建立关联的已有记忆路径列表。
+    """
+    if not tags:
+        return []
+    tag_set = set(tags)
+    matched = []
+    for e in existing_entries:
+        if len(matched) >= AUTO_LINK_MAX_LINKS:
+            break
+        shared = tag_set & set(e.get("tags") or [])
+        if len(shared) >= AUTO_LINK_MIN_SHARED_TAGS:
+            matched.append(e["file_rel"])
+    if not matched:
+        return []
+    # 新记忆 → 已有记忆
+    _append_related(mem_dir / new_file_rel, matched)
+    # 已有记忆 → 新记忆（双向）
+    for rel in matched:
+        _append_related(mem_dir / rel, [new_file_rel])
+    return matched
 
 
 def _find_duplicate(existing_entries: list, category: str, content: str,
@@ -431,6 +480,10 @@ def _add_memory_impl(
     file_rel_path = relpath_posix(file_path, mem_dir)
     _update_index_for_entry(file_rel_path, category, summary, priority, tags, entry_id, project_name, emphasis, mention_count, memory_dir=mem_dir)
 
+    # 6.2 标签自动互链：与共享标签的已有记忆建立双向 related_files 关联
+    auto_linked = _auto_link_related(file_rel_path, tags, existing_entries, mem_dir)
+    related_all = list(related) + auto_linked
+
     # 6.5 同步写入向量库（可选，chromadb 未安装时跳过）
     vector_notice = None
     if is_vector_available():
@@ -446,6 +499,8 @@ def _add_memory_impl(
             mention_count=mention_count,
             date=now,
             expires=expires,
+            related_files=related_all,
+            access_count=0,
             memory_dir=mem_dir,
         )
         if not vector_result.get("success") and not vector_result.get("skipped"):
